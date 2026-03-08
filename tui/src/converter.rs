@@ -1,8 +1,9 @@
 //! SVG → GCode conversion and GCode → preview-image rendering.
 //!
-//! Two public entry points:
+//! Public entry points:
 //!
-//! - [`svg_to_gcode`]  – calls the `svg2gcode` library and returns the GCode as a `String`.
+//! - [`svg_to_gcode`]  – calls the `svg2gcode` library, validates the result against machine
+//!   limits, and returns the GCode as a `String` or a detailed [`ConversionError`].
 //! - [`gcode_to_image`] – parses the GCode with `gcode-nom`, traces all G0/G1/G2/G3 moves and
 //!   renders them into an [`image::RgbaImage`] that ratatui-image can display.
 
@@ -17,12 +18,165 @@ use gcode_nom::command::Command;
 use gcode_nom::params::head::PosVal;
 use gcode_nom::{PositionMode, compute_arc};
 
+pub use laser_bb::laser_bounding_box;
+
 use roxmltree::ParsingOptions;
 use svg2gcode::{
     ConversionConfig, ConversionOptions, Machine, SupportedFunctionality, svg2program,
 };
 
 use crate::app::MachineSettings;
+
+// ── Validation error ──────────────────────────────────────────────────────────
+
+/// A structured error returned when generated GCode violates machine limits.
+///
+/// Distinct from `anyhow::Error` so the UI can render it as a dedicated popup
+/// with all the numeric detail rather than a plain error string.
+#[derive(Debug, Clone)]
+pub struct ConversionError {
+    /// Short one-line summary shown in the popup title.
+    pub title: String,
+    /// Full multi-line body with actual vs. allowed values.
+    pub body: String,
+}
+
+impl std::fmt::Display for ConversionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.title, self.body)
+    }
+}
+
+impl std::error::Error for ConversionError {}
+
+/// Validate machine settings before we even try to convert.
+fn validate_settings(settings: &MachineSettings) -> Result<(), ConversionError> {
+    let mut problems: Vec<String> = Vec::new();
+
+    if settings.feedrate <= 0.0 {
+        problems.push(format!(
+            "• Feedrate must be > 0 mm/min (currently {:.0})",
+            settings.feedrate
+        ));
+    }
+    if settings.feedrate > settings.max_speed {
+        problems.push(format!(
+            "• Feedrate {:.0} mm/min exceeds max speed {:.0} mm/min",
+            settings.feedrate, settings.max_speed
+        ));
+    }
+    if settings.tolerance <= 0.0 {
+        problems.push(format!(
+            "• Tolerance must be > 0 mm (currently {:.4})",
+            settings.tolerance
+        ));
+    }
+    if settings.dpi <= 0.0 {
+        problems.push(format!("• DPI must be > 0 (currently {:.1})", settings.dpi));
+    }
+    if settings.laser_power < 0.0 || settings.laser_power > settings.max_laser_power {
+        problems.push(format!(
+            "• Laser power {:.0} S is outside allowed range 0 – {:.0} S",
+            settings.laser_power, settings.max_laser_power
+        ));
+    }
+    if settings.max_x_mm <= 0.0 || settings.max_y_mm <= 0.0 {
+        problems.push(format!(
+            "• Work area must be positive (currently {:.1} × {:.1} mm)",
+            settings.max_x_mm, settings.max_y_mm
+        ));
+    }
+    if settings.origin_x < 0.0 || settings.origin_y < 0.0 {
+        problems.push(format!(
+            "• Origin ({:.1}, {:.1}) must be ≥ 0",
+            settings.origin_x, settings.origin_y
+        ));
+    }
+
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(ConversionError {
+            title: "Invalid machine settings".into(),
+            body: problems.join("\n"),
+        })
+    }
+}
+
+/// Check that the GCode bounding box fits inside the configured work area.
+///
+/// `bb_min` / `bb_max` are in mm as returned by [`collect_segments`].
+fn validate_extents(
+    settings: &MachineSettings,
+    bb_min: (f64, f64),
+    bb_max: (f64, f64),
+) -> Result<(), ConversionError> {
+    // The job bounding box already incorporates the origin offset because the
+    // converter shifts everything via ConversionConfig::origin.
+    let job_x = bb_max.0 - bb_min.0;
+    let job_y = bb_max.1 - bb_min.1;
+
+    // Absolute extents (where the job actually sits in machine coordinates)
+    let abs_x_min = bb_min.0;
+    let abs_y_min = bb_min.1;
+    let abs_x_max = bb_max.0;
+    let abs_y_max = bb_max.1;
+
+    let mut problems: Vec<String> = Vec::new();
+
+    if abs_x_min < 0.0 {
+        problems.push(format!(
+            "• Job starts at X {:.3} mm (must be ≥ 0)",
+            abs_x_min
+        ));
+    }
+    if abs_y_min < 0.0 {
+        problems.push(format!(
+            "• Job starts at Y {:.3} mm (must be ≥ 0)",
+            abs_y_min
+        ));
+    }
+    if abs_x_max > settings.max_x_mm {
+        problems.push(format!(
+            "• Job reaches X {:.3} mm but machine limit is {:.1} mm (overrun by {:.3} mm)",
+            abs_x_max,
+            settings.max_x_mm,
+            abs_x_max - settings.max_x_mm,
+        ));
+    }
+    if abs_y_max > settings.max_y_mm {
+        problems.push(format!(
+            "• Job reaches Y {:.3} mm but machine limit is {:.1} mm (overrun by {:.3} mm)",
+            abs_y_max,
+            settings.max_y_mm,
+            abs_y_max - settings.max_y_mm,
+        ));
+    }
+
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        let body = format!(
+            "Job size: {:.3} × {:.3} mm  (X {:.3}…{:.3}, Y {:.3}…{:.3})\n\
+             Work area: {:.1} × {:.1} mm\n\
+             \n\
+             {}",
+            job_x,
+            job_y,
+            abs_x_min,
+            abs_x_max,
+            abs_y_min,
+            abs_y_max,
+            settings.max_x_mm,
+            settings.max_y_mm,
+            problems.join("\n"),
+        );
+        Err(ConversionError {
+            title: "Job exceeds work area".into(),
+            body,
+        })
+    }
+}
 
 // ── SVG → GCode ───────────────────────────────────────────────────────────────
 
@@ -31,6 +185,10 @@ use crate::app::MachineSettings;
 /// All conversion parameters (feedrate, tolerance, dpi, origin, begin/end
 /// sequences, circular interpolation, line numbers, checksums) are taken
 /// directly from `settings`.
+///
+/// Returns a [`ConversionError`] (wrapped in `anyhow`) when:
+/// - Settings are invalid (bad feedrate, power out of range, …)
+/// - The generated toolpath exceeds the configured work area
 pub fn svg_to_gcode(svg_path: &Path, settings: &MachineSettings) -> Result<String> {
     let svg_text = std::fs::read_to_string(svg_path)
         .with_context(|| format!("Cannot read SVG file: {}", svg_path.display()))?;
@@ -48,7 +206,16 @@ pub fn svg_to_gcode(svg_path: &Path, settings: &MachineSettings) -> Result<Strin
     use g_code::emit::format_gcode_fmt;
     use g_code::parse::snippet_parser;
 
-    let begin_snippet = snippet_parser(&settings.begin_sequence)
+    // Strip any S word from the user-supplied begin sequence and append the
+    // laser power from the dedicated setting as a separate S command.
+    // This ensures the S value is always driven by "Laser power (S)" and
+    // never silently overridden by a hardcoded value in the sequence string.
+    let sanitised_begin = format!(
+        "{} S{:.0}",
+        settings.sanitised_begin_sequence(),
+        settings.laser_power,
+    );
+    let begin_snippet = snippet_parser(&sanitised_begin)
         .map_err(|e| anyhow::anyhow!("Bad begin sequence: {:?}", e))?;
     let end_snippet = snippet_parser(&settings.end_sequence)
         .map_err(|e| anyhow::anyhow!("Bad end sequence: {:?}", e))?;
@@ -75,6 +242,9 @@ pub fn svg_to_gcode(svg_path: &Path, settings: &MachineSettings) -> Result<Strin
         dimensions: [None, None],
     };
 
+    // Validate settings before doing any heavy work.
+    validate_settings(settings).map_err(|e| anyhow::anyhow!(e))?;
+
     let program = svg2program(&document, &config, options, machine);
 
     let mut gcode_string = String::new();
@@ -90,7 +260,199 @@ pub fn svg_to_gcode(svg_path: &Path, settings: &MachineSettings) -> Result<Strin
     )
     .context("Failed to format GCode")?;
 
+    // Parse the generated GCode to extract the actual toolpath bounding box
+    // and verify it fits inside the configured work area.
+    let (_segments, bb_min, bb_max) = collect_segments(&gcode_string);
+    validate_extents(settings, bb_min, bb_max).map_err(|e| anyhow::anyhow!(e))?;
+
     Ok(gcode_string)
+}
+
+// ── Laser bounding box ────────────────────────────────────────────────────────
+
+mod laser_bb {
+    use super::*;
+
+    /// Walk the GCode and return the axis-aligned bounding box of all moves
+    /// where the laser is **on** (S word > 0).
+    ///
+    /// Returns `None` when no laser-on move is found (e.g. GCode is empty or
+    /// consists only of rapid/travel moves).
+    ///
+    /// Rules applied:
+    /// - G0 moves are always rapid (laser off) and never contribute.
+    /// - G1/G2/G3 moves contribute only when the *effective* S value is > 0.
+    /// - The S word is sticky: once set it remains in effect for subsequent
+    ///   moves until a new S word appears.  This matches GRBL behaviour.
+    /// - S0 explicitly turns the laser off; those moves are excluded.
+    /// - The begin/end sequences commonly set S via `M4 S<n>` — we parse
+    ///   plain `S<n>` words that appear on any line regardless of command.
+    pub fn laser_bounding_box(gcode: &str) -> Option<((f64, f64), (f64, f64))> {
+        let mut pos = (0.0_f64, 0.0_f64);
+        let mut mode = PositionMode::Absolute;
+        let mut laser_s: f64 = 0.0; // current S value; 0 = laser off
+
+        let mut min = (f64::MAX, f64::MAX);
+        let mut max = (f64::MIN, f64::MIN);
+        let mut found = false;
+
+        let mut update = |pt: (f64, f64)| {
+            if pt.0 < min.0 {
+                min.0 = pt.0;
+            }
+            if pt.1 < min.1 {
+                min.1 = pt.1;
+            }
+            if pt.0 > max.0 {
+                max.0 = pt.0;
+            }
+            if pt.1 > max.1 {
+                max.1 = pt.1;
+            }
+            found = true;
+        };
+
+        for line in gcode.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+
+            let Ok((_, cmd)) = Command::parse_line(line) else {
+                // Still try to pick up a bare S word on lines we can't fully parse
+                // (e.g. `M4 S1000` which gcode-nom may not know).
+                laser_s = extract_s_word(line).unwrap_or(laser_s);
+                continue;
+            };
+
+            match cmd {
+                // ── Rapid: laser always off ───────────────────────────────
+                Command::G0(ref params) => {
+                    // Update S if present (uncommon on G0 but valid)
+                    if let Some(s) = extract_s_from_params(params) {
+                        laser_s = s;
+                    }
+                    let (nx, ny) = resolve_xy_bb(params, pos, &mode);
+                    pos = (nx, ny);
+                    // G0 never contributes to the laser bounding box.
+                }
+
+                // ── Linear cut ────────────────────────────────────────────
+                Command::G1(ref params) => {
+                    if let Some(s) = extract_s_from_params(params) {
+                        laser_s = s;
+                    }
+                    let (nx, ny) = resolve_xy_bb(params, pos, &mode);
+                    if laser_s > 0.0 {
+                        update(pos);
+                        update((nx, ny));
+                    }
+                    pos = (nx, ny);
+                }
+
+                // ── Clockwise arc ─────────────────────────────────────────
+                Command::G2(ref form) => {
+                    if let Some(seg) = make_arc_segment(pos, form, true) {
+                        let end = arc_endpoint(&seg);
+                        let mid = arc_midpoint(&seg);
+                        if laser_s > 0.0 {
+                            update(pos);
+                            update(end);
+                            update(mid);
+                        }
+                        pos = end;
+                    }
+                }
+
+                // ── Counter-clockwise arc ─────────────────────────────────
+                Command::G3(ref form) => {
+                    if let Some(seg) = make_arc_segment(pos, form, false) {
+                        let end = arc_endpoint(&seg);
+                        let mid = arc_midpoint(&seg);
+                        if laser_s > 0.0 {
+                            update(pos);
+                            update(end);
+                            update(mid);
+                        }
+                        pos = end;
+                    }
+                }
+
+                Command::G90 => {
+                    mode = PositionMode::Absolute;
+                }
+                Command::G91 => {
+                    mode = PositionMode::Relative;
+                }
+
+                _ => {
+                    // Pick up S words carried on non-motion commands (M3/M4/M5 etc.)
+                    // gcode-nom parses them as their own command type; we fall through
+                    // and try the raw-line fallback below.
+                }
+            }
+
+            // Fallback: scan raw line for S word so we catch M4/M3/M5 etc.
+            if let Some(s) = extract_s_word(line) {
+                laser_s = s;
+            }
+        }
+
+        if found { Some((min, max)) } else { None }
+    }
+
+    /// Extract an S word value from a raw GCode line string.
+    /// Matches `S` followed by an optional sign and digits (with optional decimal).
+    fn extract_s_word(line: &str) -> Option<f64> {
+        let upper = line.to_ascii_uppercase();
+        let idx = upper.find('S')?;
+        let rest = &upper[idx + 1..];
+        // Read digits (and optional leading sign / decimal point)
+        let end = rest
+            .find(|c: char| !c.is_ascii_digit() && c != '.' && c != '-')
+            .unwrap_or(rest.len());
+        rest[..end].parse::<f64>().ok()
+    }
+
+    /// Extract an S word from a parsed `HashSet<PosVal>`.
+    fn extract_s_from_params(params: &std::collections::HashSet<PosVal>) -> Option<f64> {
+        for p in params {
+            if let PosVal::S(s) = p {
+                return Some(*s);
+            }
+        }
+        None
+    }
+
+    /// Resolve next X/Y position from params (mirrors the private `resolve_xy`).
+    fn resolve_xy_bb(
+        params: &std::collections::HashSet<PosVal>,
+        current: (f64, f64),
+        mode: &PositionMode,
+    ) -> (f64, f64) {
+        let mut x = current.0;
+        let mut y = current.1;
+        for p in params {
+            match p {
+                PosVal::X(v) => {
+                    x = if *mode == PositionMode::Absolute {
+                        *v
+                    } else {
+                        current.0 + v
+                    };
+                }
+                PosVal::Y(v) => {
+                    y = if *mode == PositionMode::Absolute {
+                        *v
+                    } else {
+                        current.1 + v
+                    };
+                }
+                _ => {}
+            }
+        }
+        (x, y)
+    }
 }
 
 // ── GCode → preview image ─────────────────────────────────────────────────────

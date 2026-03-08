@@ -46,7 +46,8 @@ use ratatui::{
 };
 
 use crate::app::{
-    ActiveTab, App, AppMode, ConversionStatus, FocusedPane, LineKind, MachineSettings,
+    ActiveTab, App, AppMode, ConversionErrorPopup, ConversionStatus, FocusedPane, LineKind,
+    MachineSettings,
 };
 
 // ── Palette ───────────────────────────────────────────────────────────────────
@@ -100,6 +101,9 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     // Overlays (drawn on top of everything)
     if app.baud_dropdown_open {
         render_baud_dropdown(app, frame, area);
+    }
+    if let Some(popup) = &app.conversion_error_popup {
+        render_conversion_error_popup(popup, frame, area);
     }
 }
 
@@ -588,10 +592,40 @@ fn render_gcode_controls(app: &App, frame: &mut Frame, area: Rect) {
             ),
             Style::default().fg(C_INFO),
         )]),
-        Line::from(vec![Span::styled(
-            "  o:open SVG   c:convert   s:save GCode   ↑↓/PgUp/Dn:scroll",
-            Style::default().fg(C_INFO),
-        )]),
+        if app.is_streaming {
+            // Show a progress bar while streaming
+            let pct = if app.stream_total > 0 {
+                (app.stream_sent * 100) / app.stream_total
+            } else {
+                0
+            };
+            let bar_w = 20usize;
+            let filled = (pct * bar_w) / 100;
+            let bar = format!(
+                "{}{}",
+                "█".repeat(filled),
+                "░".repeat(bar_w.saturating_sub(filled))
+            );
+            Line::from(vec![
+                Span::styled(
+                    "  Streaming: ",
+                    Style::default().fg(C_WARN).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(bar, Style::default().fg(C_OK)),
+                Span::styled(
+                    format!(
+                        " {}/{} ({}%)  a:abort",
+                        app.stream_sent, app.stream_total, pct
+                    ),
+                    Style::default().fg(C_WARN),
+                ),
+            ])
+        } else {
+            Line::from(vec![Span::styled(
+                "  o:open SVG   c:convert   s:save   g:send   f:frame job   ↑↓/PgUp/Dn:scroll",
+                Style::default().fg(C_INFO),
+            )])
+        },
     ];
 
     let block = Block::default()
@@ -1552,7 +1586,7 @@ fn render_settings_help(app: &App, frame: &mut Frame, area: Rect) {
     let idx = app.settings_selected;
     let description: &str = match idx {
         0 => {
-            "GCode sent before the job starts.\nTypically sets units, distance mode\nand turns the laser on.\nExample: G90 G21 M4 S1000"
+            "GCode sent before the job starts.\nTypically sets units, distance mode\nand turns the laser on.\nDo NOT include an S word here –\nthe laser power is appended\nautomatically from the\n'Laser power (S)' setting.\nExample: G90 G21 M4"
         }
         1 => {
             "GCode sent after the job ends.\nTypically turns the laser off\nand stops the program.\nExample: M5 M2"
@@ -1652,7 +1686,11 @@ fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
                 }
             }
             ActiveTab::GCode => {
-                "F1-F5:tabs  o:open SVG  c:convert  s:save  g:send to GRBL  ↑↓/PgUp/Dn:scroll  q:quit"
+                if app.is_streaming {
+                    "Streaming GCode…  a:abort  q:quit"
+                } else {
+                    "F1-F5:tabs  o:open SVG  c:convert  s:save  g:send  a:abort  f:frame job  ↑↓/PgUp/Dn:scroll  q:quit"
+                }
             }
             ActiveTab::Preview => "F1-F5:tabs  p:render preview  q:quit",
             ActiveTab::Settings => {
@@ -1707,6 +1745,60 @@ fn render_status_bar(app: &App, frame: &mut Frame, area: Rect) {
 // ═══════════════════════════════════════════════════════════════════════════════
 // Help overlay
 // ═══════════════════════════════════════════════════════════════════════════════
+
+pub fn render_conversion_error_popup(popup: &ConversionErrorPopup, frame: &mut Frame, area: Rect) {
+    let width = 62u16.min(area.width);
+    // Height: 2 border + 1 gap + body lines (count them) + 2 gap + 1 hint
+    let body_lines = popup.body.lines().count() as u16;
+    let height = (body_lines + 6).min(area.height);
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let popup_area = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+
+    frame.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .title(Span::styled(
+            format!(" ✗ {} ", popup.title),
+            Style::default()
+                .fg(Color::Black)
+                .bg(C_ERR)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(C_ERR));
+
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    // Split inner area: body text on top, dismiss hint pinned to bottom
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(inner);
+
+    frame.render_widget(
+        Paragraph::new(popup.body.as_str())
+            .style(Style::default().fg(C_TITLE))
+            .wrap(Wrap { trim: false }),
+        rows[0],
+    );
+
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            " Press Enter, Esc or Space to dismiss ",
+            Style::default().fg(C_INFO),
+        ))
+        .alignment(Alignment::Center),
+        rows[1],
+    );
+}
 
 pub fn render_help_overlay(frame: &mut Frame) {
     let area = frame.area();
@@ -1812,7 +1904,15 @@ pub fn render_help_overlay(frame: &mut Frame) {
             Style::default().fg(C_TITLE),
         )),
         Line::from(Span::styled(
-            "  g          Stream GCode to connected GRBL machine",
+            "  g          Stream GCode (ok-gated, one line at a time)",
+            Style::default().fg(C_TITLE),
+        )),
+        Line::from(Span::styled(
+            "  a          Abort an in-progress GCode stream",
+            Style::default().fg(C_TITLE),
+        )),
+        Line::from(Span::styled(
+            "  f          Frame job: trace laser bounding box with laser off (S0)",
             Style::default().fg(C_TITLE),
         )),
         Line::from(Span::styled(

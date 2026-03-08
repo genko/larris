@@ -46,11 +46,22 @@ use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::{
-    app::{ActiveTab, App, AppMode, ControlFocus, ConversionStatus, FocusedPane, MachineSettings},
-    converter::{gcode_to_image, svg_to_gcode},
+    app::{
+        ActiveTab, App, AppMode, ControlFocus, ConversionErrorPopup, ConversionStatus, FocusedPane,
+        MachineSettings,
+    },
+    converter::{ConversionError, gcode_to_image, laser_bounding_box, svg_to_gcode},
     grbl::{GrblLine, JogDir},
     serial::{SerialCommand, SerialEvent, discover_ports, spawn_serial_actor, validate_port_path},
 };
+
+// ── Streaming helpers ─────────────────────────────────────────────────────────
+
+fn apply_stream_progress(app: &mut App, sent: usize, total: usize) {
+    app.stream_sent = sent;
+    app.stream_total = total;
+    app.set_status(format!("Streaming GCode: {sent}/{total} lines"), Some(10));
+}
 
 // ── Poll ──────────────────────────────────────────────────────────────────────
 
@@ -77,6 +88,27 @@ pub fn drain_serial_events(
 
     loop {
         match rx.try_recv() {
+            Ok(SerialEvent::StreamProgress { sent, total }) => {
+                apply_stream_progress(app, sent, total);
+            }
+            Ok(SerialEvent::StreamDone { total }) => {
+                app.is_streaming = false;
+                app.stream_sent = total;
+                app.stream_total = total;
+                app.push_info(format!("GCode stream complete – {total} lines sent."));
+                app.set_status(format!("Stream done: {total} lines"), Some(200));
+            }
+            Ok(SerialEvent::StreamAborted {
+                sent,
+                total,
+                reason,
+            }) => {
+                app.is_streaming = false;
+                app.push_error(format!(
+                    "GCode stream aborted after {sent}/{total} lines: {reason}"
+                ));
+                app.set_status(format!("Stream aborted at {sent}/{total}"), Some(200));
+            }
             Ok(SerialEvent::Line(line)) => {
                 // Parse the line through the GRBL classifier and update app state.
                 let parsed = GrblLine::parse(&line);
@@ -192,6 +224,17 @@ pub fn handle_key(
     serial_rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<SerialEvent>>,
     show_help: &mut bool,
 ) -> bool {
+    // ── Dismiss conversion error popup ────────────────────────────────────
+    if app.conversion_error_popup.is_some() {
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char(' ') => {
+                app.dismiss_conversion_error();
+                return true;
+            }
+            _ => return false,
+        }
+    }
+
     // ── Dismiss help overlay ──────────────────────────────────────────────
     if *show_help {
         match key.code {
@@ -752,6 +795,18 @@ fn handle_gcode_tab(app: &mut App, key: KeyEvent) -> bool {
             true
         }
 
+        // Abort an in-progress GCode stream
+        KeyCode::Char('a') | KeyCode::Char('A') => {
+            do_abort_stream(app);
+            true
+        }
+
+        // Frame job – trace bounding box with laser off
+        KeyCode::Char('f') | KeyCode::Char('F') => {
+            do_frame_job(app);
+            true
+        }
+
         // Scroll
         KeyCode::Up | KeyCode::Char('k') => {
             app.gcode_scroll_up();
@@ -1012,9 +1067,108 @@ fn do_poll_status(app: &mut App) {
 /// Each non-empty, non-comment line is sent as a separate serial command.
 /// The lines are enqueued via the serial actor's unbounded channel; the actor
 /// sends them in order.  A summary is printed to the console.
+/// Abort a running GCode stream.
+fn do_abort_stream(app: &mut App) {
+    if !app.is_streaming {
+        app.set_status("No active stream to abort.", Some(60));
+        return;
+    }
+    if let Some(tx) = &app.serial_tx {
+        let _ = tx.send(SerialCommand::AbortStream);
+    }
+    app.push_info("Aborting GCode stream…");
+}
+
+/// Trace the laser-on bounding box of the current GCode with the laser off (S0)
+/// so the user can visually verify the job position on the machine before burning.
+///
+/// Only G1/G2/G3 moves that carry a non-zero S word (laser power) are considered
+/// when computing the bounding box – rapid travel moves are excluded.
+///
+/// The sequence sent is:
+///   G90 G21              (absolute mode, mm)
+///   G0 S0 F<feed> X<x0> Y<y0>   → front-left corner
+///   G0 X<x1> Y<y0>              → front-right
+///   G0 X<x1> Y<y1>              → back-right
+///   G0 X<x0> Y<y1>              → back-left
+///   G0 X<x0> Y<y0>              → back to start
+fn do_frame_job(app: &mut App) {
+    if app.mode != AppMode::Connected {
+        app.push_error("Not connected – cannot frame job.");
+        app.set_status("Not connected.", Some(80));
+        return;
+    }
+
+    let gcode = match &app.gcode_text {
+        Some(g) => g.clone(),
+        None => {
+            app.push_error("No GCode to frame. Convert an SVG first.");
+            app.set_status("No GCode available.", Some(80));
+            return;
+        }
+    };
+
+    let Some((bb_min, bb_max)) = laser_bounding_box(&gcode) else {
+        app.push_error("No laser-on moves found in GCode – nothing to frame.");
+        app.set_status("No laser moves to frame.", Some(80));
+        return;
+    };
+
+    let (x0, y0) = bb_min;
+    let (x1, y1) = bb_max;
+    let feed = app.machine_settings.feedrate;
+
+    app.push_info(format!(
+        "Framing job: X {:.3}…{:.3} mm, Y {:.3}…{:.3} mm",
+        x0, x1, y0, y1
+    ));
+
+    // Build the five rapid moves that trace the rectangle with laser off.
+    let commands: &[(&str, f64, f64)] = &[
+        ("front-left", x0, y0),
+        ("front-right", x1, y0),
+        ("back-right", x1, y1),
+        ("back-left", x0, y1),
+        ("front-left", x0, y0), // close the rectangle
+    ];
+
+    // Preamble: ensure absolute mm mode and laser off.
+    send_serial_raw(app, "G90 G21");
+
+    for (i, (_label, x, y)) in commands.iter().enumerate() {
+        let cmd = if i == 0 {
+            // First move: include S0 and feedrate explicitly.
+            format!("G0 S0 F{feed:.0} X{x:.3} Y{y:.3}")
+        } else {
+            format!("G0 X{x:.3} Y{y:.3}")
+        };
+        if let Some(tx) = &app.serial_tx {
+            if tx.send(SerialCommand::Send(cmd.clone())).is_err() {
+                app.push_error("Serial channel closed during frame job.");
+                return;
+            }
+        }
+    }
+
+    app.set_status(
+        format!(
+            "Framing: {:.1}×{:.1} mm at ({:.1},{:.1})",
+            x1 - x0,
+            y1 - y0,
+            x0,
+            y0
+        ),
+        Some(200),
+    );
+}
+
 fn do_send_gcode(app: &mut App) {
     if app.mode != AppMode::Connected {
         app.push_error("Not connected – cannot stream GCode.");
+        return;
+    }
+    if app.is_streaming {
+        app.push_error("Already streaming – press 'a' to abort first.");
         return;
     }
     let gcode = match app.gcode_text.clone() {
@@ -1025,10 +1179,37 @@ fn do_send_gcode(app: &mut App) {
         }
     };
 
-    let lines: Vec<&str> = gcode
+    // Filter out blank lines and comment-only lines.
+    // Each line is also stripped of inline comments so GRBL sees clean tokens.
+    let lines: Vec<String> = gcode
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with(';') && !l.starts_with('('))
+        .map(|l| {
+            // Strip anything from ';' onwards (inline comment)
+            let l = if let Some(pos) = l.find(';') {
+                &l[..pos]
+            } else {
+                l
+            };
+            // Strip parenthesised comments  (anything inside '(' … ')')
+            let mut out = String::with_capacity(l.len());
+            let mut depth = 0usize;
+            for ch in l.chars() {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => {
+                        if depth > 0 {
+                            depth -= 1;
+                        }
+                    }
+                    _ if depth == 0 => out.push(ch),
+                    _ => {}
+                }
+            }
+            out.trim().to_owned()
+        })
+        .filter(|l| !l.is_empty())
         .collect();
 
     let count = lines.len();
@@ -1037,18 +1218,20 @@ fn do_send_gcode(app: &mut App) {
         return;
     }
 
-    app.push_info(format!("Streaming {count} GCode lines to GRBL…"));
+    app.push_info(format!(
+        "Starting ok-gated GCode stream: {count} lines. Press 'a' to abort."
+    ));
+    app.is_streaming = true;
+    app.stream_sent = 0;
+    app.stream_total = count;
+    app.set_status(format!("Streaming GCode: 0/{count} lines"), Some(10));
 
     if let Some(tx) = &app.serial_tx {
-        for line in &lines {
-            if tx.send(SerialCommand::Send(line.to_string())).is_err() {
-                app.push_error("Serial channel closed during GCode stream.");
-                return;
-            }
+        if tx.send(SerialCommand::Stream(lines)).is_err() {
+            app.push_error("Serial channel closed.");
+            app.is_streaming = false;
         }
     }
-
-    app.set_status(format!("Streaming {count} lines…"), Some(200));
 }
 
 /// Send a raw string to the serial actor (no history push).
@@ -1183,10 +1366,19 @@ fn do_convert(app: &mut App) {
             app.set_status(format!("Converted: {} GCode lines.", line_count), Some(120));
         }
         Err(e) => {
-            let msg = format!("{e:#}");
-            app.push_error(format!("Conversion failed: {msg}"));
-            app.conversion_status = ConversionStatus::Failed(msg.clone());
-            app.set_status(format!("Conversion failed: {msg}"), Some(120));
+            // Check whether the underlying cause is a structured ConversionError
+            // so we can show a rich popup instead of a plain status-bar message.
+            if let Some(conv_err) = e.downcast_ref::<ConversionError>() {
+                app.conversion_status = ConversionStatus::Failed(conv_err.title.clone());
+                app.push_error(format!("Conversion failed: {}", conv_err.title));
+                app.show_conversion_error(conv_err.title.clone(), conv_err.body.clone());
+                app.set_status(format!("Conversion failed: {}", conv_err.title), Some(200));
+            } else {
+                let msg = format!("{e:#}");
+                app.push_error(format!("Conversion failed: {msg}"));
+                app.conversion_status = ConversionStatus::Failed(msg.clone());
+                app.set_status(format!("Conversion failed: {msg}"), Some(120));
+            }
         }
     }
 }

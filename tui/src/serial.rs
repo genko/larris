@@ -3,7 +3,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serialport::{DataBits, FlowControl, Parity, SerialPort, StopBits};
 use tokio::sync::mpsc;
 
@@ -68,6 +68,16 @@ pub enum SerialEvent {
     Info(String),
     /// An error message to surface in the console.
     Error(String),
+    /// A GCode stream is in progress: `sent` lines acknowledged so far out of `total`.
+    StreamProgress { sent: usize, total: usize },
+    /// The GCode stream finished successfully.
+    StreamDone { total: usize },
+    /// The GCode stream was aborted (by the user or due to an error).
+    StreamAborted {
+        sent: usize,
+        total: usize,
+        reason: String,
+    },
 }
 
 /// Commands the UI sends to the serial actor.
@@ -75,6 +85,13 @@ pub enum SerialEvent {
 pub enum SerialCommand {
     /// Send a raw string to the device (a `\n` is appended automatically).
     Send(String),
+    /// Stream a list of GCode lines using GRBL's ok-gated simple-sender
+    /// protocol: send one line, wait for `ok` or `error:N`, then send the
+    /// next.  Progress events are emitted for every acknowledgement.
+    Stream(Vec<String>),
+    /// Abort an in-progress Stream (the current line finishes but no further
+    /// lines are sent).
+    AbortStream,
     /// Close the port and shut down the actor.
     Disconnect,
 }
@@ -145,26 +162,66 @@ fn serial_actor_loop(
     let mut reader = BufReader::new(port);
     let mut line_buf = String::new();
 
+    // When Some(_), we are in streaming mode.
+    let mut stream: Option<StreamState> = None;
+
     loop {
         // ── Check for pending commands (non-blocking) ─────────────────────
         loop {
             match cmd_rx.try_recv() {
                 Ok(SerialCommand::Send(text)) => {
-                    // Forward to the writer thread
-                    if write_tx.send(Some(text)).is_err() {
-                        // Writer already dead
+                    if stream.is_some() {
+                        // Ignore raw sends during streaming to avoid
+                        // confusing GRBL's ok sequencing.
+                        let _ = evt_tx.send(SerialEvent::Info(
+                            "Raw send ignored while streaming – abort stream first.".into(),
+                        ));
+                    } else if write_tx.send(Some(text)).is_err() {
                         break;
                     }
                 }
+                Ok(SerialCommand::Stream(lines)) => {
+                    if stream.is_some() {
+                        let _ = evt_tx.send(SerialEvent::Info(
+                            "Already streaming – ignoring duplicate Stream command.".into(),
+                        ));
+                    } else if lines.is_empty() {
+                        let _ = evt_tx.send(SerialEvent::StreamDone { total: 0 });
+                    } else {
+                        let total = lines.len();
+                        let _ = evt_tx.send(SerialEvent::Info(format!(
+                            "Starting GCode stream: {total} lines"
+                        )));
+                        // Send the very first line immediately.
+                        let first = lines[0].clone();
+                        if write_tx.send(Some(first)).is_err() {
+                            break;
+                        }
+                        stream = Some(StreamState {
+                            lines,
+                            next_idx: 1, // next line to send after ack
+                            sent: 0,     // lines acknowledged so far
+                            abort: false,
+                        });
+                    }
+                }
+                Ok(SerialCommand::AbortStream) => {
+                    if let Some(ref st) = stream {
+                        let _ = evt_tx.send(SerialEvent::StreamAborted {
+                            sent: st.sent,
+                            total: st.lines.len(),
+                            reason: "Aborted by user".into(),
+                        });
+                        stream = None;
+                    }
+                }
                 Ok(SerialCommand::Disconnect) => {
-                    // Signal writer to stop
                     let _ = write_tx.send(None);
                     let _ = evt_tx.send(SerialEvent::Disconnected(None));
                     return;
                 }
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
-                    // UI dropped the command sender – clean up
                     let _ = write_tx.send(None);
                     let _ = evt_tx.send(SerialEvent::Disconnected(None));
                     return;
@@ -186,8 +243,62 @@ fn serial_actor_loop(
             }
             Ok(_) => {
                 let text = line_buf.trim_end_matches(['\r', '\n']).to_string();
-                if !text.is_empty() {
-                    let _ = evt_tx.send(SerialEvent::Line(text));
+                if text.is_empty() {
+                    continue;
+                }
+
+                // Always forward the raw line to the UI.
+                let _ = evt_tx.send(SerialEvent::Line(text.clone()));
+
+                // ── ok-gated streaming ────────────────────────────────────
+                if let Some(ref mut st) = stream {
+                    let is_ok = text.eq_ignore_ascii_case("ok");
+                    let is_error = text.to_ascii_lowercase().starts_with("error:");
+
+                    if is_ok || is_error {
+                        st.sent += 1;
+                        let total = st.lines.len();
+
+                        if is_error {
+                            // On error: report and abort the stream.
+                            let _ = evt_tx.send(SerialEvent::StreamAborted {
+                                sent: st.sent,
+                                total,
+                                reason: format!(
+                                    "GRBL reported '{}' on line {} of {}",
+                                    text, st.sent, total
+                                ),
+                            });
+                            stream = None;
+                            continue;
+                        }
+
+                        // Emit progress.
+                        let _ = evt_tx.send(SerialEvent::StreamProgress {
+                            sent: st.sent,
+                            total,
+                        });
+
+                        if st.abort || st.next_idx >= total {
+                            // All lines sent and acknowledged – done.
+                            let _ = evt_tx.send(SerialEvent::StreamDone { total: st.sent });
+                            stream = None;
+                        } else {
+                            // Send the next line.
+                            let next = st.lines[st.next_idx].clone();
+                            st.next_idx += 1;
+                            if write_tx.send(Some(next)).is_err() {
+                                let _ = evt_tx.send(SerialEvent::StreamAborted {
+                                    sent: st.sent,
+                                    total,
+                                    reason: "Writer thread died".into(),
+                                });
+                                stream = None;
+                            }
+                        }
+                    }
+                    // Non-ok/error lines (status reports, messages) are
+                    // already forwarded above; streaming is not affected.
                 }
             }
             Err(ref e)
@@ -205,6 +316,18 @@ fn serial_actor_loop(
             }
         }
     }
+}
+
+/// State kept while streaming GCode line by line.
+struct StreamState {
+    /// All lines to be sent.
+    lines: Vec<String>,
+    /// Index of the next line to send (after the current ack).
+    next_idx: usize,
+    /// Number of lines acknowledged so far.
+    sent: usize,
+    /// When true, stop after the current in-flight line is acked.
+    abort: bool,
 }
 
 /// Blocking loop that writes lines to the serial port.

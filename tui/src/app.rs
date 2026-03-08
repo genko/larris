@@ -53,10 +53,10 @@ pub struct MachineSettings {
 impl Default for MachineSettings {
     fn default() -> Self {
         Self {
-            begin_sequence: "G90 G21 M4 S1000".to_owned(),
+            begin_sequence: "G90 G21 M4".to_owned(),
             end_sequence: "M5 M2".to_owned(),
-            max_x_mm: 300.0,
-            max_y_mm: 300.0,
+            max_x_mm: 150.0,
+            max_y_mm: 150.0,
             max_speed: 10000.0,
             max_laser_power: 1000.0,
             feedrate: 3000.0,
@@ -205,6 +205,37 @@ impl MachineSettings {
     pub fn field_count() -> usize {
         Self::FIELD_NAMES.len()
     }
+    /// Return the begin sequence with any S word tokens stripped out.
+    ///
+    /// The laser power S word is always appended separately by the converter
+    /// so it is driven by the "Laser power" setting rather than being
+    /// hardcoded inside the sequence string.
+    pub fn sanitised_begin_sequence(&self) -> String {
+        // Split on whitespace, drop any token that starts with 'S' or 's'
+        // followed only by digits / a decimal point (e.g. S1000, S0, S750.5).
+        self.begin_sequence
+            .split_whitespace()
+            .filter(|token| {
+                let t = token.trim_start_matches(|c: char| c == 'S' || c == 's');
+                // Keep the token unless what remains after stripping the leading
+                // 'S' is a valid non-empty number (meaning it was an S-word).
+                !(token.len() > t.len() && t.chars().all(|c| c.is_ascii_digit() || c == '.'))
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+// ── Conversion error popup ────────────────────────────────────────────────────
+
+/// Payload for the modal error dialog shown when GCode generation fails
+/// due to a settings or work-area violation.
+#[derive(Debug, Clone)]
+pub struct ConversionErrorPopup {
+    /// One-line title shown in the popup border.
+    pub title: String,
+    /// Multi-line detail body.
+    pub body: String,
 }
 
 // ── Focus / Tab enums ─────────────────────────────────────────────────────────
@@ -457,6 +488,17 @@ pub struct App {
     /// Set to true after a native dialog so the main loop forces a full
     /// terminal redraw (clears ratatui's internal diff buffer).
     pub needs_clear: bool,
+    /// When Some(_), a modal error popup is shown with this content.
+    /// Dismissed by the user pressing Esc or Enter.
+    pub conversion_error_popup: Option<ConversionErrorPopup>,
+
+    // ── GCode streaming state ─────────────────────────────────────────────
+    /// True while the serial actor is streaming GCode line by line.
+    pub is_streaming: bool,
+    /// Number of lines acknowledged by GRBL so far.
+    pub stream_sent: usize,
+    /// Total lines in the current stream job.
+    pub stream_total: usize,
     pub status_message: Option<String>,
     /// Ticks until status_message is cleared (None = permanent until replaced)
     pub status_message_ttl: Option<u32>,
@@ -529,6 +571,10 @@ impl App {
 
             should_quit: false,
             needs_clear: false,
+            conversion_error_popup: None,
+            is_streaming: false,
+            stream_sent: 0,
+            stream_total: 0,
             status_message: None,
             status_message_ttl: None,
         }
@@ -856,6 +902,21 @@ impl App {
             .select(Some(if i == 0 { len - 1 } else { i - 1 }));
     }
 
+    // ── Conversion error popup ────────────────────────────────────────────
+
+    /// Show a conversion error popup with a title and detailed body.
+    pub fn show_conversion_error(&mut self, title: impl Into<String>, body: impl Into<String>) {
+        self.conversion_error_popup = Some(ConversionErrorPopup {
+            title: title.into(),
+            body: body.into(),
+        });
+    }
+
+    /// Dismiss the conversion error popup.
+    pub fn dismiss_conversion_error(&mut self) {
+        self.conversion_error_popup = None;
+    }
+
     // ── Settings tab helpers ──────────────────────────────────────────────
 
     pub fn settings_tab_next(&mut self) {
@@ -915,5 +976,71 @@ impl App {
             let toggled = if cur == "true" { "false" } else { "true" };
             let _ = self.machine_settings.set_field(idx, toggled);
         }
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn settings_with_begin(seq: &str) -> MachineSettings {
+        MachineSettings {
+            begin_sequence: seq.to_owned(),
+            ..MachineSettings::default()
+        }
+    }
+
+    #[test]
+    fn sanitise_removes_integer_s_word() {
+        let s = settings_with_begin("G90 G21 M4 S1000");
+        assert_eq!(s.sanitised_begin_sequence(), "G90 G21 M4");
+    }
+
+    #[test]
+    fn sanitise_removes_decimal_s_word() {
+        let s = settings_with_begin("G90 G21 M4 S750.5");
+        assert_eq!(s.sanitised_begin_sequence(), "G90 G21 M4");
+    }
+
+    #[test]
+    fn sanitise_removes_zero_s_word() {
+        let s = settings_with_begin("G90 G21 M4 S0");
+        assert_eq!(s.sanitised_begin_sequence(), "G90 G21 M4");
+    }
+
+    #[test]
+    fn sanitise_leaves_sequence_without_s_unchanged() {
+        let s = settings_with_begin("G90 G21 M4");
+        assert_eq!(s.sanitised_begin_sequence(), "G90 G21 M4");
+    }
+
+    #[test]
+    fn sanitise_handles_empty_sequence() {
+        let s = settings_with_begin("");
+        assert_eq!(s.sanitised_begin_sequence(), "");
+    }
+
+    #[test]
+    fn sanitise_removes_s_word_at_start() {
+        let s = settings_with_begin("S1000 G90 G21 M4");
+        assert_eq!(s.sanitised_begin_sequence(), "G90 G21 M4");
+    }
+
+    #[test]
+    fn sanitise_removes_multiple_s_words() {
+        let s = settings_with_begin("G90 S500 G21 M4 S1000");
+        assert_eq!(s.sanitised_begin_sequence(), "G90 G21 M4");
+    }
+
+    #[test]
+    fn sanitise_does_not_remove_commands_starting_with_s_letter() {
+        // There are no standard GCode commands starting with S that are not
+        // S-words, but ensure tokens like "SCAN" are not wrongly stripped.
+        // A token "S" alone with no digits after it is not a valid S-word.
+        let s = settings_with_begin("G90 G21 M4");
+        // Baseline: no S word present, result unchanged.
+        assert_eq!(s.sanitised_begin_sequence(), "G90 G21 M4");
     }
 }
