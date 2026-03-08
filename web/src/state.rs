@@ -54,6 +54,7 @@ impl TryInto<Settings> for &FormState {
                     self.origin[1].clone().transpose()?,
                 ],
                 extra_attribute_name: None,
+                beam_width: 0.1,
             },
             machine: MachineConfig {
                 supported_functionality: SupportedFunctionality {
@@ -79,6 +80,8 @@ impl TryInto<Settings> for &FormState {
                     .clone()
                     .transpose()
                     .map_err(FormStateConversionError::GCode)?,
+                max_feedrate: None,
+                max_power: None,
             },
             postprocess: PostprocessConfig {
                 checksums: self.checksums,

@@ -21,6 +21,20 @@ mod transform;
 mod units;
 mod visit;
 
+/// How a layer should be rendered by the laser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum LayerMode {
+    /// Only draw the outline paths of each shape (default SVG behaviour).
+    #[default]
+    Default,
+    /// Draw only the outline paths, no fill.
+    Outline,
+    /// Fill the interior of each shape with parallel hatch lines spaced
+    /// `beam_width` apart (raster fill).
+    Fill,
+}
+
 /// High-level output configuration
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -36,10 +50,18 @@ pub struct ConversionConfig {
     pub origin: [Option<f64>; 2],
     /// Set extra attribute to add when printing node name
     pub extra_attribute_name: Option<String>,
+    /// Laser beam diameter in millimeters, used as the spacing between hatch
+    /// lines when a layer is set to [`LayerMode::Fill`].
+    #[cfg_attr(feature = "serde", serde(default = "default_beam_width"))]
+    pub beam_width: f64,
 }
 
 const fn zero_origin() -> [Option<f64>; 2] {
     [Some(0.); 2]
+}
+
+fn default_beam_width() -> f64 {
+    0.1
 }
 
 impl Default for ConversionConfig {
@@ -50,6 +72,7 @@ impl Default for ConversionConfig {
             dpi: 96.0,
             origin: zero_origin(),
             extra_attribute_name: None,
+            beam_width: default_beam_width(),
         }
     }
 }
@@ -67,6 +90,9 @@ pub struct LayerOverrideOptions {
     pub power: Option<f64>,
     /// Number of passes (≥ 1)
     pub passes: Option<u32>,
+    /// Rendering mode for this layer (outline-only, default, or fill).
+    /// `None` means inherit from the SVG `data-mode` attribute or use `LayerMode::Default`.
+    pub mode: Option<LayerMode>,
 }
 
 /// Options are specific to this conversion.
@@ -85,7 +111,10 @@ pub struct ConversionOptions {
     /// Values here take precedence over `data-*` attributes encoded directly in the SVG,
     /// but they can still be superseded by nested `<g>` elements that carry their own
     /// `data-*` attributes (innermost always wins, per the existing stack semantics).
-    #[cfg_attr(feature = "serde", serde(default))]
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "HashMap::is_empty")
+    )]
     pub layer_overrides: HashMap<String, LayerOverrideOptions>,
 }
 
@@ -121,7 +150,7 @@ struct ConversionVisitor<'a, T: Turtle> {
 }
 
 /// Per-group layer settings read from `data-*` attributes.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 struct LayerOverride {
     /// `data-feedrate` — overrides the global feedrate (mm/min) for this layer.
     feedrate: Option<f64>,
@@ -129,11 +158,21 @@ struct LayerOverride {
     power: Option<f64>,
     /// `data-passes` — how many times every path in this layer should be repeated.
     passes: Option<u32>,
+    /// `data-mode` — rendering mode: "outline", "fill", or "default".
+    mode: Option<LayerMode>,
+    /// When mode is `Fill`, the flattened edge segments of all child primitives
+    /// (in mm space) collected by a [`GeometryCollectorTurtle`] pre-pass.
+    /// These are used by the scanline fill algorithm to clip hatch lines to the
+    /// actual shape interior rather than just the bounding box.
+    fill_segments: Vec<lyon_geom::LineSegment<f64>>,
 }
 
 impl LayerOverride {
     fn has_any(&self) -> bool {
-        self.feedrate.is_some() || self.power.is_some() || self.passes.is_some()
+        self.feedrate.is_some()
+            || self.power.is_some()
+            || self.passes.is_some()
+            || self.mode.is_some()
     }
 }
 
@@ -266,6 +305,8 @@ pub struct SvgLayerInfo {
     pub svg_power: Option<f64>,
     /// `data-passes` attribute value baked into the SVG, if any.
     pub svg_passes: Option<u32>,
+    /// `data-mode` attribute value baked into the SVG, if any.
+    pub svg_mode: Option<LayerMode>,
 }
 
 /// Walk the SVG document and return one [`SvgLayerInfo`] per `<g>` element,
@@ -295,6 +336,14 @@ pub fn extract_svg_layers(doc: &Document) -> Vec<SvgLayerInfo> {
                 .attribute("data-passes")
                 .and_then(|v| v.parse::<u32>().ok())
                 .map(|p| p.max(1));
+            let svg_mode = node.attribute("data-mode").and_then(|v| {
+                match v.trim().to_ascii_lowercase().as_str() {
+                    "outline" => Some(LayerMode::Outline),
+                    "fill" => Some(LayerMode::Fill),
+                    "default" => Some(LayerMode::Default),
+                    _ => None,
+                }
+            });
 
             layers.push(SvgLayerInfo {
                 key,
@@ -302,6 +351,7 @@ pub fn extract_svg_layers(doc: &Document) -> Vec<SvgLayerInfo> {
                 svg_feedrate,
                 svg_power,
                 svg_passes,
+                svg_mode,
             });
         }
         for child in node.children() {

@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 
 use image::RgbaImage;
-use svg2gcode::{LayerOverrideOptions, SvgLayerInfo};
+use svg2gcode::{LayerMode, LayerOverrideOptions, SvgLayerInfo};
 
 use crate::serial::SerialCommand;
 
@@ -27,6 +27,8 @@ pub struct MachineSettings {
     pub max_speed: f64,
     /// Maximum laser power (S-word ceiling, typically 1000 for GRBL)
     pub max_laser_power: f64,
+    /// Laser beam diameter in mm, used as hatch line spacing for fill layers.
+    pub beam_width: f64,
 
     // ── Conversion parameters ─────────────────────────────────────────────
     /// Laser-on feedrate in mm/min
@@ -60,6 +62,7 @@ impl Default for MachineSettings {
             max_y_mm: 150.0,
             max_speed: 10000.0,
             max_laser_power: 1000.0,
+            beam_width: 0.1,
             feedrate: 3000.0,
             tolerance: 0.1,
             dpi: 96.0,
@@ -82,6 +85,7 @@ impl MachineSettings {
         "Max Y (mm)",
         "Max speed (mm/min)",
         "Max laser power (S)",
+        "Beam width (mm)",
         "Feedrate (mm/min)",
         "Tolerance (mm)",
         "DPI",
@@ -102,27 +106,28 @@ impl MachineSettings {
             3 => format!("{:.1}", self.max_y_mm),
             4 => format!("{:.0}", self.max_speed),
             5 => format!("{:.0}", self.max_laser_power),
-            6 => format!("{:.0}", self.feedrate),
-            7 => format!("{:.4}", self.tolerance),
-            8 => format!("{:.1}", self.dpi),
-            9 => format!("{:.0}", self.laser_power),
-            10 => format!("{:.1}", self.origin_x),
-            11 => format!("{:.1}", self.origin_y),
-            12 => {
+            6 => format!("{:.4}", self.beam_width),
+            7 => format!("{:.0}", self.feedrate),
+            8 => format!("{:.4}", self.tolerance),
+            9 => format!("{:.1}", self.dpi),
+            10 => format!("{:.0}", self.laser_power),
+            11 => format!("{:.1}", self.origin_x),
+            12 => format!("{:.1}", self.origin_y),
+            13 => {
                 if self.circular_interpolation {
                     "true".into()
                 } else {
                     "false".into()
                 }
             }
-            13 => {
+            14 => {
                 if self.line_numbers {
                     "true".into()
                 } else {
                     "false".into()
                 }
             }
-            14 => {
+            15 => {
                 if self.checksums {
                     "true".into()
                 } else {
@@ -164,38 +169,46 @@ impl MachineSettings {
                 .map_err(|e| e.to_string()),
             6 => s
                 .parse::<f64>()
-                .map(|v| self.feedrate = v)
+                .map(|v| {
+                    if v > 0.0 {
+                        self.beam_width = v;
+                    }
+                })
                 .map_err(|e| e.to_string()),
             7 => s
                 .parse::<f64>()
-                .map(|v| self.tolerance = v)
+                .map(|v| self.feedrate = v)
                 .map_err(|e| e.to_string()),
             8 => s
                 .parse::<f64>()
-                .map(|v| self.dpi = v)
+                .map(|v| self.tolerance = v)
                 .map_err(|e| e.to_string()),
             9 => s
                 .parse::<f64>()
-                .map(|v| self.laser_power = v)
+                .map(|v| self.dpi = v)
                 .map_err(|e| e.to_string()),
             10 => s
                 .parse::<f64>()
-                .map(|v| self.origin_x = v)
+                .map(|v| self.laser_power = v)
                 .map_err(|e| e.to_string()),
             11 => s
                 .parse::<f64>()
+                .map(|v| self.origin_x = v)
+                .map_err(|e| e.to_string()),
+            12 => s
+                .parse::<f64>()
                 .map(|v| self.origin_y = v)
                 .map_err(|e| e.to_string()),
-            12 => {
+            13 => {
                 self.circular_interpolation =
                     matches!(s.to_ascii_lowercase().as_str(), "true" | "1" | "yes");
                 Ok(())
             }
-            13 => {
+            14 => {
                 self.line_numbers = matches!(s.to_ascii_lowercase().as_str(), "true" | "1" | "yes");
                 Ok(())
             }
-            14 => {
+            15 => {
                 self.checksums = matches!(s.to_ascii_lowercase().as_str(), "true" | "1" | "yes");
                 Ok(())
             }
@@ -205,6 +218,35 @@ impl MachineSettings {
 
     pub fn field_count() -> usize {
         Self::FIELD_NAMES.len()
+    }
+
+    /// Return a description / hint string for a settings field (shown in the help panel).
+    pub fn field_help(idx: usize) -> &'static str {
+        match idx {
+            0 => {
+                "GCode emitted at job start (e.g. G90 G21 M4). S-words are stripped; use 'Laser power' field instead."
+            }
+            1 => "GCode emitted at job end (e.g. M5 M2).",
+            2 => "Maximum X travel in mm (used to validate job extents).",
+            3 => "Maximum Y travel in mm.",
+            4 => "Maximum feedrate in mm/min (ceiling for per-layer speed overrides).",
+            5 => "Maximum laser power S-word value (ceiling for per-layer power overrides).",
+            6 => {
+                "Laser beam diameter in mm. Used as hatch line spacing when a layer is set to Fill mode. Default: 0.1"
+            }
+            7 => "Laser-on feedrate in mm/min.",
+            8 => "Bezier curve linearisation tolerance in mm.",
+            9 => "Dots per inch assumed for SVG pixel/point/pica units.",
+            10 => "Laser power S-word appended to the begin sequence.",
+            11 => "X origin offset in mm (shifts the entire job).",
+            12 => "Y origin offset in mm.",
+            13 => {
+                "Emit G2/G3 arc commands. Enable only if your firmware supports circular interpolation."
+            }
+            14 => "Prepend line numbers (N words) to every GCode line.",
+            15 => "Append XOR checksums to every GCode line.",
+            _ => "",
+        }
     }
     /// Return the begin sequence with any S word tokens stripped out.
     ///
@@ -268,6 +310,8 @@ pub struct TuiLayerSettings {
     pub power: Option<f64>,
     /// User-override pass count (`None` = use SVG value or 1).
     pub passes: Option<u32>,
+    /// Rendering mode for this layer.
+    pub mode: LayerMode,
 
     /// Value baked into the SVG `data-feedrate` attribute (read-only).
     pub svg_feedrate: Option<f64>,
@@ -275,19 +319,24 @@ pub struct TuiLayerSettings {
     pub svg_power: Option<f64>,
     /// Value baked into the SVG `data-passes` attribute (read-only).
     pub svg_passes: Option<u32>,
+    /// Rendering mode baked into the SVG `data-mode` attribute (read-only).
+    pub svg_mode: LayerMode,
 }
 
 impl TuiLayerSettings {
     pub fn from_svg_layer(info: &SvgLayerInfo, max_feedrate: f64, max_power: f64) -> Self {
+        let svg_mode = info.svg_mode.unwrap_or(LayerMode::Default);
         Self {
             label: info.label.clone(),
             key: info.key.clone(),
             feedrate: info.svg_feedrate.map(|f| f.min(max_feedrate)),
             power: info.svg_power.map(|p| p.min(max_power)),
             passes: info.svg_passes,
+            mode: svg_mode,
             svg_feedrate: info.svg_feedrate,
             svg_power: info.svg_power,
             svg_passes: info.svg_passes,
+            svg_mode,
         }
     }
 
@@ -297,6 +346,25 @@ impl TuiLayerSettings {
             feedrate: self.feedrate,
             power: self.power,
             passes: self.passes,
+            mode: Some(self.mode),
+        }
+    }
+
+    /// Cycle the layer mode forward: Default → Outline → Fill → Default.
+    pub fn cycle_mode(&mut self) {
+        self.mode = match self.mode {
+            LayerMode::Default => LayerMode::Outline,
+            LayerMode::Outline => LayerMode::Fill,
+            LayerMode::Fill => LayerMode::Default,
+        };
+    }
+
+    /// Return a short label for the current mode.
+    pub fn mode_label(&self) -> &'static str {
+        match self.mode {
+            LayerMode::Default => "Default",
+            LayerMode::Outline => "Outline",
+            LayerMode::Fill => "Fill",
         }
     }
 
@@ -309,7 +377,7 @@ impl TuiLayerSettings {
             .unwrap_or(global_feedrate);
         let p = self.power.or(self.svg_power).unwrap_or(global_power);
         let passes = self.passes.or(self.svg_passes).unwrap_or(1);
-        format!("F{:.0} S{:.0} ×{}", f, p, passes)
+        format!("F{:.0} S{:.0} ×{} [{}]", f, p, passes, self.mode_label())
     }
 }
 
@@ -521,12 +589,20 @@ pub struct App {
     pub layer_edit_error: Option<String>,
 
     // ── Preview image ─────────────────────────────────────────────────────
-    /// RGBA pixel image built by tracing the GCode toolpath (for ratatui-image)
+    /// RGBA pixel image built by rendering the source SVG (for ratatui-image)
     pub preview_image: Option<RgbaImage>,
-    /// Protocol state for ratatui-image (stateful widget)
+    /// Protocol state for ratatui-image for the SVG preview panel
     pub preview_protocol: Option<ratatui_image::protocol::StatefulProtocol>,
-    /// Whether the preview needs to be re-encoded (size changed, new image, …)
+    /// Whether the SVG preview needs to be re-encoded (size changed, new image, …)
     pub preview_dirty: bool,
+
+    /// RGBA pixel image built by tracing the GCode toolpath (for ratatui-image)
+    pub gcode_preview_image: Option<RgbaImage>,
+    /// Protocol state for ratatui-image for the GCode toolpath preview panel
+    pub gcode_preview_protocol: Option<ratatui_image::protocol::StatefulProtocol>,
+
+    /// When true, G0 rapid/travel moves are drawn in the GCode toolpath preview
+    pub show_travel_lines: bool,
 
     // ── Machine & conversion settings ─────────────────────────────────────
     pub machine_settings: MachineSettings,
@@ -642,6 +718,10 @@ impl App {
             preview_image: None,
             preview_protocol: None,
             preview_dirty: false,
+
+            gcode_preview_image: None,
+            gcode_preview_protocol: None,
+            show_travel_lines: false,
 
             machine_settings: MachineSettings::default(),
             settings_selected: 0,
@@ -948,7 +1028,11 @@ impl App {
             .iter()
             .filter_map(|l| {
                 let opts = l.to_override_options();
-                if opts.feedrate.is_some() || opts.power.is_some() || opts.passes.is_some() {
+                if opts.feedrate.is_some()
+                    || opts.power.is_some()
+                    || opts.passes.is_some()
+                    || opts.mode.is_some()
+                {
                     Some((l.key.clone(), opts))
                 } else {
                     None
@@ -1074,12 +1158,13 @@ impl App {
         self.layer_edit_error = None;
     }
 
-    /// Clear all user overrides for every layer.
+    /// Clear all user overrides for every layer (revert to SVG-baked values).
     pub fn layer_clear_all(&mut self) {
         for layer in &mut self.layers {
             layer.feedrate = layer.svg_feedrate;
             layer.power = layer.svg_power;
             layer.passes = layer.svg_passes;
+            layer.mode = layer.svg_mode;
         }
         self.layer_edit_field = None;
         self.layer_edit_buf.clear();
@@ -1238,10 +1323,10 @@ impl App {
         self.settings_edit_error = None;
     }
 
-    /// Toggle a boolean field (fields 12–14).
+    /// Toggle a boolean field (fields 13–15).
     pub fn settings_toggle_bool(&mut self) {
         let idx = self.settings_selected;
-        if idx >= 12 {
+        if idx >= 13 {
             let cur = self.machine_settings.field_value(idx);
             let toggled = if cur == "true" { "false" } else { "true" };
             let _ = self.machine_settings.set_field(idx, toggled);
@@ -1395,46 +1480,54 @@ mod tests {
     }
 
     #[test]
+    fn set_field_roundtrip_beam_width() {
+        let mut s = MachineSettings::default();
+        s.set_field(6, "0.2").unwrap();
+        assert!((s.beam_width - 0.2).abs() < 1e-9);
+        assert_eq!(s.field_value(6), "0.2000");
+    }
+
+    #[test]
     fn set_field_roundtrip_feedrate() {
         let mut s = MachineSettings::default();
-        s.set_field(6, "1500").unwrap();
+        s.set_field(7, "1500").unwrap();
         assert!((s.feedrate - 1500.0).abs() < 1e-9);
-        assert_eq!(s.field_value(6), "1500");
+        assert_eq!(s.field_value(7), "1500");
     }
 
     #[test]
     fn set_field_roundtrip_tolerance() {
         let mut s = MachineSettings::default();
-        s.set_field(7, "0.0500").unwrap();
+        s.set_field(8, "0.0500").unwrap();
         assert!((s.tolerance - 0.05).abs() < 1e-9);
     }
 
     #[test]
     fn set_field_roundtrip_dpi() {
         let mut s = MachineSettings::default();
-        s.set_field(8, "72.0").unwrap();
+        s.set_field(9, "72.0").unwrap();
         assert!((s.dpi - 72.0).abs() < 1e-9);
     }
 
     #[test]
     fn set_field_roundtrip_laser_power() {
         let mut s = MachineSettings::default();
-        s.set_field(9, "750").unwrap();
+        s.set_field(10, "750").unwrap();
         assert!((s.laser_power - 750.0).abs() < 1e-9);
-        assert_eq!(s.field_value(9), "750");
+        assert_eq!(s.field_value(10), "750");
     }
 
     #[test]
     fn set_field_roundtrip_origin_x() {
         let mut s = MachineSettings::default();
-        s.set_field(10, "12.5").unwrap();
+        s.set_field(11, "12.5").unwrap();
         assert!((s.origin_x - 12.5).abs() < 1e-9);
     }
 
     #[test]
     fn set_field_roundtrip_origin_y() {
         let mut s = MachineSettings::default();
-        s.set_field(11, "7.0").unwrap();
+        s.set_field(12, "7.0").unwrap();
         assert!((s.origin_y - 7.0).abs() < 1e-9);
     }
 
@@ -1442,60 +1535,60 @@ mod tests {
     fn set_field_roundtrip_circular_interpolation_true() {
         let mut s = MachineSettings::default();
         assert!(!s.circular_interpolation);
-        s.set_field(12, "true").unwrap();
+        s.set_field(13, "true").unwrap();
         assert!(s.circular_interpolation);
-        assert_eq!(s.field_value(12), "true");
+        assert_eq!(s.field_value(13), "true");
     }
 
     #[test]
     fn set_field_roundtrip_circular_interpolation_false() {
         let mut s = MachineSettings::default();
         s.circular_interpolation = true;
-        s.set_field(12, "false").unwrap();
+        s.set_field(13, "false").unwrap();
         assert!(!s.circular_interpolation);
-        assert_eq!(s.field_value(12), "false");
+        assert_eq!(s.field_value(13), "false");
     }
 
     #[test]
     fn set_field_boolean_accepts_1_and_yes() {
         let mut s = MachineSettings::default();
-        s.set_field(13, "1").unwrap();
+        s.set_field(14, "1").unwrap();
         assert!(s.line_numbers);
-        s.set_field(13, "yes").unwrap();
+        s.set_field(14, "yes").unwrap();
         assert!(s.line_numbers);
-        s.set_field(13, "no").unwrap();
+        s.set_field(14, "no").unwrap();
         assert!(!s.line_numbers);
     }
 
     #[test]
     fn set_field_roundtrip_line_numbers() {
         let mut s = MachineSettings::default();
-        s.set_field(13, "true").unwrap();
+        s.set_field(14, "true").unwrap();
         assert!(s.line_numbers);
-        assert_eq!(s.field_value(13), "true");
+        assert_eq!(s.field_value(14), "true");
     }
 
     #[test]
     fn set_field_roundtrip_checksums() {
         let mut s = MachineSettings::default();
-        s.set_field(14, "true").unwrap();
+        s.set_field(15, "true").unwrap();
         assert!(s.checksums);
-        assert_eq!(s.field_value(14), "true");
+        assert_eq!(s.field_value(15), "true");
     }
 
     #[test]
     fn set_field_rejects_non_numeric_for_numeric_field() {
         let mut s = MachineSettings::default();
         assert!(s.set_field(2, "not_a_number").is_err());
-        assert!(s.set_field(6, "abc").is_err());
-        assert!(s.set_field(7, "???").is_err());
+        assert!(s.set_field(7, "abc").is_err());
+        assert!(s.set_field(8, "???").is_err());
     }
 
     #[test]
     fn set_field_trims_whitespace() {
         let mut s = MachineSettings::default();
         // Numeric field with surrounding whitespace should still parse
-        s.set_field(6, "  2000  ").unwrap();
+        s.set_field(7, "  2000  ").unwrap();
         assert!((s.feedrate - 2000.0).abs() < 1e-9);
         // String field with surrounding whitespace is trimmed too
         s.set_field(0, "  G90  ").unwrap();

@@ -4,6 +4,7 @@ use super::svg_layer_key;
 
 use euclid::default::Transform2D;
 use log::{debug, warn};
+use lyon_geom::LineSegment;
 use roxmltree::{Document, Node};
 use svgtypes::{
     AspectRatio, LengthListParser, PathParser, PathSegment, PointsParser, TransformListParser,
@@ -11,12 +12,102 @@ use svgtypes::{
 };
 
 use super::{
-    ConversionVisitor, LayerOverride,
+    ConversionVisitor, LayerMode, LayerOverride,
     path::apply_path,
     transform::{get_viewport_transform, svg_transform_into_euclid_transform},
     units::DimensionHint,
 };
-use crate::{Turtle, converter::node_name};
+use crate::{Turtle, converter::node_name, turtle::scanline_fill_lines};
+
+/// Parse a `data-mode` string value into a [`LayerMode`].
+fn parse_layer_mode(s: &str) -> Option<LayerMode> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "outline" => Some(LayerMode::Outline),
+        "fill" => Some(LayerMode::Fill),
+        "default" => Some(LayerMode::Default),
+        _ => None,
+    }
+}
+
+/// Collect all flattened edge segments (in millimeters) of the shapes inside
+/// the children of `group_node`.
+///
+/// `initial_transform` must already include the group's own SVG transform as
+/// well as any outer transforms (i.e. it should be captured from the main
+/// visitor's `current_transform()` *after* `push_transform` has been called for
+/// the group).
+///
+/// A [`GeometryCollectorTurtle`] wrapped in a [`DpiConvertingTurtle`] is used
+/// so that all coordinates are in the same millimeter space as the main
+/// conversion output.  Curves are flattened using `config.tolerance`.
+///
+/// Returns the collected segments, or an empty `Vec` if the group contains no
+/// renderable geometry.
+fn geometry_of_group_children(
+    group_node: Node,
+    initial_transform: Transform2D<f64>,
+    config: &super::ConversionConfig,
+    options: &super::ConversionOptions,
+) -> Vec<LineSegment<f64>> {
+    use super::ConversionVisitor as CV;
+    use crate::turtle::{DpiConvertingTurtle, GeometryCollectorTurtle, Terrarium};
+
+    let mut visitor: CV<DpiConvertingTurtle<GeometryCollectorTurtle>> = CV {
+        terrarium: {
+            let mut t = Terrarium::new(DpiConvertingTurtle {
+                inner: GeometryCollectorTurtle::new(config.tolerance),
+                dpi: config.dpi,
+            });
+            // Seed with the composed transform that is active at this point in
+            // the main conversion (group's own transform already included).
+            t.push_transform(initial_transform);
+            t
+        },
+        _config: config,
+        options: options.clone(),
+        name_stack: vec![],
+        viewport_dim_stack: vec![],
+        layer_override_stack: vec![],
+        group_counter: 0,
+    };
+
+    // Do NOT call visitor.begin() / visitor.end() here.
+    // begin() would push an additional scale(1,-1) Y-flip, but that flip is
+    // already baked into `initial_transform` (which was captured from the main
+    // visitor's current_transform() after begin() had already been called there).
+    // Calling it again would double-apply the flip, mirroring all Y coordinates
+    // and producing coordinates entirely outside the work area.
+    for child in group_node.children() {
+        visit_subtree(child, &mut visitor);
+    }
+
+    visitor.terrarium.turtle.inner.segments
+}
+
+/// Recursively visit a node and its subtree, calling `visitor.visit_enter` /
+/// `visitor.visit_exit` for each renderable element.  This mirrors the logic
+/// in `depth_first_visit` but works for an arbitrary sub-tree root.
+fn visit_subtree<T: Turtle>(node: Node, visitor: &mut ConversionVisitor<T>) {
+    if !node.is_element() {
+        return;
+    }
+    if node
+        .attribute("style")
+        .is_some_and(|s| s.contains("display:none"))
+    {
+        return;
+    }
+    // Skip defs / markers / symbols when pre-computing bbox (they are not rendered directly).
+    match node.tag_name().name() {
+        "defs" | "marker" | "symbol" => return,
+        _ => {}
+    }
+    visitor.visit_enter(node);
+    for child in node.children() {
+        visit_subtree(child, visitor);
+    }
+    visitor.visit_exit(node);
+}
 
 const SVG_TAG_NAME: &str = "svg";
 const CLIP_PATH_TAG_NAME: &str = "clipPath";
@@ -43,11 +134,14 @@ fn should_render_node(node: Node) -> bool {
     node.is_element()
         && !node
             .attribute("style")
-            .is_some_and( |style| style.contains("display:none"))
+            .is_some_and(|style| style.contains("display:none"))
         // - Defs are not rendered
         // - Markers are not directly rendered
         // - Symbols are not directly rendered
-        && !matches!(node.tag_name().name(), DEFS_TAG_NAME | MARKER_TAG_NAME | SYMBOL_TAG_NAME)
+        && !matches!(
+            node.tag_name().name(),
+            DEFS_TAG_NAME | MARKER_TAG_NAME | SYMBOL_TAG_NAME
+        )
 }
 
 /// Resolve `href` or `xlink:href` on a `<use>` element to a document node.
@@ -281,6 +375,7 @@ impl<'a, T: Turtle> XmlVisitor for ConversionVisitor<'a, T> {
         //   data-feedrate : mm/min
         //   data-power    : S word (firmware-specific, e.g. 0–1000 for GRBL)
         //   data-passes   : positive integer, number of times each path is repeated
+        //   data-mode     : "outline" | "fill" | "default"
         //
         // UI-supplied overrides (in `self.options.layer_overrides`) take precedence over
         // values baked into the SVG's `data-*` attributes.
@@ -299,17 +394,39 @@ impl<'a, T: Turtle> XmlVisitor for ConversionVisitor<'a, T> {
                 .attribute("data-passes")
                 .and_then(|v| v.parse::<u32>().ok())
                 .map(|p| p.max(1));
+            let svg_mode = node.attribute("data-mode").and_then(parse_layer_mode);
 
             // UI override (higher priority) — merge on top of SVG values
             let ui = self.options.layer_overrides.get(&key);
             let feedrate = ui.and_then(|o| o.feedrate).or(svg_feedrate);
             let power = ui.and_then(|o| o.power).or(svg_power);
             let passes = ui.and_then(|o| o.passes).map(|p| p.max(1)).or(svg_passes);
+            let mode = ui.and_then(|o| o.mode).or(svg_mode);
+
+            // If this group is set to Fill mode, collect the flattened edge segments
+            // of all children in millimeter space.  We do this now (at enter time)
+            // using a lightweight pre-pass so the segments are available at exit time
+            // when we emit the scanline hatch lines.
+            //
+            // `self.terrarium.current_transform()` already includes the group's own
+            // SVG transform because `push_transform` was called just above.
+            let fill_segments = if mode == Some(LayerMode::Fill) {
+                geometry_of_group_children(
+                    node,
+                    self.terrarium.current_transform(),
+                    self._config,
+                    &self.options,
+                )
+            } else {
+                vec![]
+            };
 
             let layer_override = LayerOverride {
                 feedrate,
                 power,
                 passes,
+                mode,
+                fill_segments,
             };
 
             if layer_override.has_any() {
@@ -541,6 +658,25 @@ impl<'a, T: Turtle> XmlVisitor for ConversionVisitor<'a, T> {
         // Restore the previous layer override (or clear it) when exiting a group node.
         if node.tag_name().name() == GROUP_TAG_NAME {
             if let Some(exiting) = self.layer_override_stack.pop() {
+                // If this group is in Fill mode, emit hatch lines over the pre-computed bbox.
+                //
+                // The bbox is in millimeters (the pre-computation used DpiConvertingTurtle
+                // → PreprocessTurtle).  We emit via `hatch_lines_mm` which bypasses the
+                // DPI conversion layer and writes directly to the inner GCodeTurtle, so the
+                // coordinates stay in mm and are not double-converted.
+                if exiting.mode == Some(LayerMode::Fill) {
+                    if !exiting.fill_segments.is_empty() {
+                        let beam_width = self._config.beam_width;
+                        let lines = scanline_fill_lines(&exiting.fill_segments, beam_width);
+                        if !lines.is_empty() {
+                            self.terrarium
+                                .turtle
+                                .comment(format!("Fill hatch (beam_width={beam_width}mm)"));
+                            self.terrarium.turtle.hatch_lines_mm(&lines);
+                        }
+                    }
+                }
+
                 // Only need to restore feedrate/power state if this group changed them.
                 if exiting.feedrate.is_some() || exiting.power.is_some() {
                     // Search outward for the nearest enclosing group that set feedrate/power.
@@ -549,7 +685,7 @@ impl<'a, T: Turtle> XmlVisitor for ConversionVisitor<'a, T> {
                         .iter()
                         .rev()
                         .find(|e| e.feedrate.is_some() || e.power.is_some())
-                        .copied();
+                        .cloned();
                     match previous {
                         Some(LayerOverride {
                             feedrate, power, ..

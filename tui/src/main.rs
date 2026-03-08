@@ -133,16 +133,21 @@ async fn run_event_loop(
         // ── Drain serial events ───────────────────────────────────────────
         drain_serial_events(app, &mut serial_rx);
 
-        // ── Encode preview image into StatefulProtocol if dirty ───────────
+        // ── Encode preview images into StatefulProtocols if new ───────────
         //
-        // `app.preview_image` is set by `do_render_preview()` in events.rs.
-        // We consume it here (take) so we only encode once per render request.
+        // `app.preview_image` is set when an SVG preview is ready.
+        // `app.gcode_preview_image` is set by `do_render_preview()` in events.rs.
+        // We consume each here (take) so we only encode once per render request.
         if let Some(img) = app.preview_image.take() {
             // `new_resize_protocol` creates a StatefulProtocol that will be
             // resized at render-time to fit the available widget area.
             let proto = picker.new_resize_protocol(image::DynamicImage::ImageRgba8(img));
             app.preview_protocol = Some(proto);
             app.preview_dirty = false;
+        }
+        if let Some(img) = app.gcode_preview_image.take() {
+            let proto = picker.new_resize_protocol(image::DynamicImage::ImageRgba8(img));
+            app.gcode_preview_protocol = Some(proto);
         }
 
         // ── Force full repaint after native dialogs ───────────────────────

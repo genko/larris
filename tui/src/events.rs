@@ -886,7 +886,7 @@ fn handle_layer_list(app: &mut App, key: KeyEvent) -> bool {
             true
         }
 
-        // Begin editing a field
+        // Begin editing a numeric field
         KeyCode::Char('f') | KeyCode::Char('F') => {
             app.layer_begin_edit(0);
             true
@@ -897,6 +897,21 @@ fn handle_layer_list(app: &mut App, key: KeyEvent) -> bool {
         }
         KeyCode::Char('n') | KeyCode::Char('N') => {
             app.layer_begin_edit(2);
+            true
+        }
+
+        // Cycle the rendering mode (Default → Outline → Fill → Default)
+        KeyCode::Char('m') | KeyCode::Char('M') => {
+            let idx = app.layer_selected;
+            if idx < app.layers.len() {
+                app.layers[idx].cycle_mode();
+                let msg = format!(
+                    "Layer '{}' mode → {}",
+                    app.layers[idx].label,
+                    app.layers[idx].mode_label()
+                );
+                app.set_status(msg, Some(60));
+            }
             true
         }
 
@@ -954,6 +969,16 @@ fn handle_preview_tab(app: &mut App, key: KeyEvent) -> bool {
             do_render_preview(app);
             true
         }
+        KeyCode::Char('t') | KeyCode::Char('T') => {
+            app.show_travel_lines = !app.show_travel_lines;
+            let state = if app.show_travel_lines { "on" } else { "off" };
+            app.set_status(format!("Travel lines {state}."), Some(60));
+            // Re-render the GCode preview if we already have one.
+            if app.gcode_text.is_some() {
+                do_render_preview(app);
+            }
+            true
+        }
         _ => false,
     }
 }
@@ -989,7 +1014,7 @@ fn handle_settings_tab(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Enter | KeyCode::Char('e') | KeyCode::Char('E') => {
             let idx = app.settings_selected;
             // Boolean fields are toggled directly; all others open an edit buffer.
-            if idx >= 12 {
+            if idx >= 13 {
                 app.settings_toggle_bool();
             } else {
                 app.settings_begin_edit();
@@ -1422,6 +1447,8 @@ fn do_open_svg(app: &mut App) {
             app.preview_image = None;
             app.preview_protocol = None;
             app.preview_dirty = false;
+            app.gcode_preview_image = None;
+            app.gcode_preview_protocol = None;
             app.gcode_focus = GCodeFocus::GCode;
         }
         None => {
@@ -1479,6 +1506,8 @@ fn do_convert(app: &mut App) {
     app.preview_image = None;
     app.preview_protocol = None;
     app.preview_dirty = false;
+    app.gcode_preview_image = None;
+    app.gcode_preview_protocol = None;
 
     let settings = app.machine_settings.clone();
     let layer_overrides = app.layer_override_map();
@@ -1601,16 +1630,16 @@ fn do_render_preview(app: &mut App) {
         }
     };
 
+    let travel = app.show_travel_lines;
     app.set_status("Rendering toolpath preview…", Some(20));
 
     // Reasonable pixel dimensions for the preview panel
     let max_w = 800u32;
     let max_h = 600u32;
 
-    match gcode_to_image(&gcode, max_w, max_h) {
+    match gcode_to_image(&gcode, max_w, max_h, travel) {
         Ok(img) => {
-            app.preview_image = Some(img);
-            app.preview_dirty = false;
+            app.gcode_preview_image = Some(img);
             app.push_info("Toolpath preview rendered.");
             app.set_status("Preview ready.", Some(100));
         }

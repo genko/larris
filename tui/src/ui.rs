@@ -785,7 +785,7 @@ fn render_layer_panel(app: &App, frame: &mut Frame, area: Rect) {
         if app.layer_edit_field.is_some() {
             "Enter:confirm  Esc:cancel"
         } else {
-            "f:speed  p:pwr  n:passes  r:reset  Esc:back"
+            "f:spd  p:pwr  n:pass  m:mode  r:reset  Esc:back"
         }
     } else {
         "l:focus layers"
@@ -795,8 +795,8 @@ fn render_layer_panel(app: &App, frame: &mut Frame, area: Rect) {
         hint_area,
     );
 
-    // One row per layer; each row is 4 lines tall (label + 3 fields)
-    let row_h: u16 = 4;
+    // One row per layer; each row is 5 lines tall (label + speed + power + passes + mode)
+    let row_h: u16 = 5;
     let visible = (body_area.height / row_h) as usize;
     let total = app.layers.len();
 
@@ -859,10 +859,10 @@ fn render_layer_panel(app: &App, frame: &mut Frame, area: Rect) {
             label_area,
         );
 
-        // Three field rows: Speed, Power, Passes
-        let field_names = ["Spd", "Pwr", "×  "];
-        let field_edit_idx = [0, 1, 2];
-        let field_values: [String; 3] = [
+        // Four field rows: Speed, Power, Passes, Mode
+        let field_names = ["Spd", "Pwr", "×  ", "Mod"];
+        let field_edit_idx = [0usize, 1, 2, 3];
+        let field_values: [String; 4] = [
             {
                 let v = layer.feedrate.or(layer.svg_feedrate);
                 match v {
@@ -884,15 +884,17 @@ fn render_layer_panel(app: &App, frame: &mut Frame, area: Rect) {
                     None => "(1)".to_owned(),
                 }
             },
+            layer.mode_label().to_owned(),
         ];
-        // Whether this value is a user override (not falling back)
-        let is_override: [bool; 3] = [
+        // Whether this value is a user override (not falling back to SVG/global default)
+        let is_override: [bool; 4] = [
             layer.feedrate.is_some(),
             layer.power.is_some(),
             layer.passes.is_some(),
+            layer.mode != svg2gcode::LayerMode::Default,
         ];
 
-        for fi in 0..3usize {
+        for fi in 0..4usize {
             let field_area = Rect {
                 y: row_rect.y + 1 + fi as u16,
                 height: 1,
@@ -1029,9 +1031,16 @@ fn render_svg_preview_panel(app: &mut App, frame: &mut Frame, area: Rect) {
 }
 
 fn render_gcode_preview_panel(app: &mut App, frame: &mut Frame, area: Rect) {
+    let travel_indicator = if app.show_travel_lines {
+        " [travel: ON]"
+    } else {
+        " [travel: OFF]"
+    };
+    let title = format!(" GCode Toolpath{travel_indicator} ");
+
     let block = Block::default()
         .title(Span::styled(
-            " GCode Toolpath ",
+            title,
             Style::default().fg(C_TITLE).add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
@@ -1040,24 +1049,6 @@ fn render_gcode_preview_panel(app: &mut App, frame: &mut Frame, area: Rect) {
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
-
-    if app.gcode_text.is_some() && app.preview_dirty {
-        // Signal to the caller that we need a new render; the event loop handles it.
-        // While rendering is in progress show a placeholder.
-        frame.render_widget(
-            Paragraph::new(vec![
-                Line::from(""),
-                Line::from(Span::styled(
-                    "  Rendering toolpath…",
-                    Style::default()
-                        .fg(C_WARN)
-                        .add_modifier(Modifier::SLOW_BLINK),
-                )),
-            ]),
-            inner,
-        );
-        return;
-    }
 
     if app.gcode_text.is_none() {
         frame.render_widget(
@@ -1073,49 +1064,26 @@ fn render_gcode_preview_panel(app: &mut App, frame: &mut Frame, area: Rect) {
         return;
     }
 
-    // If the preview image has been rasterised into preview_image and encoded
-    // into preview_protocol, render it. Otherwise show a hint.
-    if let Some(proto) = app.preview_protocol.as_mut() {
-        // We share the same protocol slot with the SVG panel; for the toolpath
-        // we render a second copy. Because ratatui-image's StatefulProtocol is
-        // stateful (tracks position/dirty), we keep two separate slots in a
-        // future iteration. For now, if a protocol exists the SVG preview owns
-        // it and the toolpath shows the raw stats.
-        let stats = app
-            .gcode_text
-            .as_deref()
-            .map(|g| {
-                let moves = g
-                    .lines()
-                    .filter(|l| {
-                        let u = l.trim_start().to_uppercase();
-                        u.starts_with("G0")
-                            || u.starts_with("G1")
-                            || u.starts_with("G2")
-                            || u.starts_with("G3")
-                    })
-                    .count();
-                format!("  {} move commands", moves)
-            })
-            .unwrap_or_default();
+    // If the GCode toolpath has been rasterised, render the image.
+    if let Some(proto) = app.gcode_preview_protocol.as_mut() {
+        let image_widget = ratatui_image::StatefulImage::default();
+        frame.render_stateful_widget(image_widget, inner, proto);
 
-        let _ = proto; // suppress unused warning when sharing slot
-
+        // Overlay a small hint line at the bottom of the inner area.
+        let hint_area = Rect {
+            x: inner.x,
+            y: inner.y + inner.height.saturating_sub(1),
+            width: inner.width,
+            height: 1,
+        };
+        let travel_hint = if app.show_travel_lines {
+            "  t: hide travel  p: re-render"
+        } else {
+            "  t: show travel  p: re-render"
+        };
         frame.render_widget(
-            Paragraph::new(vec![
-                Line::from(""),
-                Line::from(Span::styled(
-                    "  Toolpath ready.",
-                    Style::default().fg(C_OK).add_modifier(Modifier::BOLD),
-                )),
-                Line::from(Span::styled(stats, Style::default().fg(C_INFO))),
-                Line::from(""),
-                Line::from(Span::styled(
-                    "  Press 'p' to regenerate preview.",
-                    Style::default().fg(C_INFO),
-                )),
-            ]),
-            inner,
+            Paragraph::new(Span::styled(travel_hint, Style::default().fg(C_INFO))),
+            hint_area,
         );
     } else {
         frame.render_widget(
@@ -1123,6 +1091,11 @@ fn render_gcode_preview_panel(app: &mut App, frame: &mut Frame, area: Rect) {
                 Line::from(""),
                 Line::from(Span::styled(
                     "  Press 'p' to render toolpath preview.",
+                    Style::default().fg(C_INFO),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  Press 't' to toggle travel (rapid) lines.",
                     Style::default().fg(C_INFO),
                 )),
             ]),
@@ -1847,19 +1820,22 @@ fn render_settings_help(app: &App, frame: &mut Frame, area: Rect) {
         5 => {
             "Maximum laser power (S-word).\nGRBL default is 1000.\nSet $30 on the controller to match."
         }
-        6 => "Laser-on feedrate in mm/min.\nApplied to all G1 cutting moves.\nMust be > 0.",
-        7 => {
+        6 => {
+            "Laser beam diameter in mm.\nUsed as hatch line spacing when\na layer is set to Fill mode.\nDefault: 0.1 mm\nMust be > 0."
+        }
+        7 => "Laser-on feedrate in mm/min.\nApplied to all G1 cutting moves.\nMust be > 0.",
+        8 => {
             "Bézier curve tolerance in mm.\nSmaller = more GCode lines,\nbetter curve accuracy.\nTypical: 0.01 – 0.5"
         }
-        8 => "Dots-per-inch assumed for SVG\npixel / point / pica units.\nStandard web DPI is 96.",
-        9 => "Laser power written into the\nbegin sequence (S word).\nRange: 0 – Max laser power.",
-        10 => "X offset in mm applied to the\nwhole job origin.\n0 = start at machine origin.",
-        11 => "Y offset in mm applied to the\nwhole job origin.\n0 = start at machine origin.",
-        12 => {
+        9 => "Dots-per-inch assumed for SVG\npixel / point / pica units.\nStandard web DPI is 96.",
+        10 => "Laser power written into the\nbegin sequence (S word).\nRange: 0 – Max laser power.",
+        11 => "X offset in mm applied to the\nwhole job origin.\n0 = start at machine origin.",
+        12 => "Y offset in mm applied to the\nwhole job origin.\n0 = start at machine origin.",
+        13 => {
             "Emit G2/G3 arc commands instead\nof linearising curves.\nRequires GRBL firmware support.\nToggle with Enter or Space."
         }
-        13 => "Prepend line numbers (N-words)\nto every GCode line.\nToggle with Enter or Space.",
-        14 => "Append XOR checksums to every\nGCode line.\nToggle with Enter or Space.",
+        14 => "Prepend line numbers (N-words)\nto every GCode line.\nToggle with Enter or Space.",
+        15 => "Append XOR checksums to every\nGCode line.\nToggle with Enter or Space.",
         _ => "",
     };
 
@@ -2173,6 +2149,43 @@ pub fn render_help_overlay(frame: &mut Frame) {
         )),
         Line::from(""),
         Line::from(Span::styled(
+            "  GCODE TAB — Layer Panel  (press l to focus)",
+            Style::default().fg(C_HL).add_modifier(Modifier::UNDERLINED),
+        )),
+        Line::from(Span::styled(
+            "  l            Focus / unfocus layer panel",
+            Style::default().fg(C_TITLE),
+        )),
+        Line::from(Span::styled(
+            "  ↑↓ / j/k     Navigate layers",
+            Style::default().fg(C_TITLE),
+        )),
+        Line::from(Span::styled(
+            "  f            Edit speed (feedrate) for selected layer",
+            Style::default().fg(C_TITLE),
+        )),
+        Line::from(Span::styled(
+            "  p            Edit power (S-word) for selected layer",
+            Style::default().fg(C_TITLE),
+        )),
+        Line::from(Span::styled(
+            "  n            Edit pass count for selected layer",
+            Style::default().fg(C_TITLE),
+        )),
+        Line::from(Span::styled(
+            "  m            Cycle render mode: Default → Outline → Fill",
+            Style::default().fg(C_TITLE),
+        )),
+        Line::from(Span::styled(
+            "  r            Reset all layer overrides to SVG-baked values",
+            Style::default().fg(C_TITLE),
+        )),
+        Line::from(Span::styled(
+            "  [edit] Enter:save  Esc:cancel  Backspace:delete",
+            Style::default().fg(C_TITLE),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
             "  CONTROL TAB  (Tab cycles: Jog → Overrides → Settings)",
             Style::default().fg(C_HL).add_modifier(Modifier::UNDERLINED),
         )),
@@ -2231,7 +2244,11 @@ pub fn render_help_overlay(frame: &mut Frame) {
             Style::default().fg(C_HL).add_modifier(Modifier::UNDERLINED),
         )),
         Line::from(Span::styled(
-            "  p          Render toolpath preview image",
+            "  p          Render / re-render toolpath preview image",
+            Style::default().fg(C_TITLE),
+        )),
+        Line::from(Span::styled(
+            "  t          Toggle travel (rapid/G0) lines on/off",
             Style::default().fg(C_TITLE),
         )),
         Line::from(""),

@@ -241,6 +241,7 @@ pub fn svg_to_gcode(
         dpi: settings.dpi,
         origin: [Some(settings.origin_x), Some(settings.origin_y)],
         extra_attribute_name: None,
+        beam_width: settings.beam_width,
     };
 
     let options = ConversionOptions {
@@ -831,7 +832,12 @@ fn arc_midpoint(seg: &Segment) -> (f64, f64) {
 ///
 /// The image dimensions are capped at `max_w × max_h` pixels to avoid
 /// allocating enormous buffers for huge workpieces.
-pub fn gcode_to_image(gcode: &str, max_w: u32, max_h: u32) -> Result<RgbaImage> {
+pub fn gcode_to_image(
+    gcode: &str,
+    max_w: u32,
+    max_h: u32,
+    show_travel_lines: bool,
+) -> Result<RgbaImage> {
     let palette = PreviewPalette::default();
     let (segments, bb_min, bb_max) = collect_segments(gcode);
 
@@ -866,12 +872,14 @@ pub fn gcode_to_image(gcode: &str, max_w: u32, max_h: u32) -> Result<RgbaImage> 
     for seg in &segments {
         match *seg {
             Segment::Rapid { from, to } => {
-                draw_line(
-                    &mut img,
-                    to_pixel(from.0, from.1),
-                    to_pixel(to.0, to.1),
-                    palette.rapid,
-                );
+                if show_travel_lines {
+                    draw_line(
+                        &mut img,
+                        to_pixel(from.0, from.1),
+                        to_pixel(to.0, to.1),
+                        palette.rapid,
+                    );
+                }
             }
             Segment::Cut { from, to } => {
                 draw_line(

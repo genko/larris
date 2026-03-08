@@ -100,4 +100,10 @@ impl<T: Turtle> Turtle for DpiConvertingTurtle<T> {
     fn set_layer_overrides(&mut self, feedrate: Option<f64>, power: Option<f64>) {
         self.inner.set_layer_overrides(feedrate, power)
     }
+
+    /// Forward hatch lines directly to the inner turtle **without** applying DPI
+    /// conversion, because the coordinates are already in millimeters.
+    fn hatch_lines_mm(&mut self, lines: &[(lyon_geom::Point<f64>, lyon_geom::Point<f64>)]) {
+        self.inner.hatch_lines_mm(lines)
+    }
 }

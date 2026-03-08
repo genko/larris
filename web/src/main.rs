@@ -65,6 +65,7 @@ fn app() -> Html {
             for svg in app_store.svgs.iter() {
                 let options = ConversionOptions {
                     dimensions: svg.dimensions,
+                    layer_overrides: Default::default(),
                 };
 
                 let machine = Machine::new(

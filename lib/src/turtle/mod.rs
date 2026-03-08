@@ -11,7 +11,11 @@ use crate::arc::Transformed;
 mod dpi;
 mod g_code;
 mod preprocess;
-pub use self::{dpi::DpiConvertingTurtle, g_code::GCodeTurtle, preprocess::PreprocessTurtle};
+pub use self::{
+    dpi::DpiConvertingTurtle,
+    g_code::GCodeTurtle,
+    preprocess::{GeometryCollectorTurtle, PreprocessTurtle, scanline_fill_lines},
+};
 
 /// Abstraction for drawing paths based on [Turtle graphics](https://en.wikipedia.org/wiki/Turtle_graphics)
 pub trait Turtle: Debug {
@@ -26,6 +30,19 @@ pub trait Turtle: Debug {
     /// Override per-layer feedrate and/or laser power (S value).
     /// Pass `None` to clear a previously set override and revert to the global setting.
     fn set_layer_overrides(&mut self, feedrate: Option<f64>, power: Option<f64>);
+    /// Emit a series of hatch fill line segments. Coordinates are in **millimeters**
+    /// (already fully converted from SVG user-units). Implementations that wrap
+    /// another turtle and apply DPI conversion (e.g. [`DpiConvertingTurtle`]) must
+    /// forward these directly to the inner turtle **without** any additional unit
+    /// conversion. The default implementation forwards through `move_to`/`line_to`,
+    /// which is correct for turtles that already work in mm (e.g. `GCodeTurtle`,
+    /// `PreprocessTurtle`).
+    fn hatch_lines_mm(&mut self, lines: &[(Point<f64>, Point<f64>)]) {
+        for &(from, to) in lines {
+            self.move_to(from);
+            self.line_to(to);
+        }
+    }
 }
 
 /// Wrapper for [Turtle] that handles transforms, position, offsets, etc.  See https://www.w3.org/TR/SVG/paths.html
@@ -38,6 +55,16 @@ pub struct Terrarium<T: Turtle + std::fmt::Debug> {
     pub transform_stack: Vec<Transform2D<f64>>,
     previous_quadratic_control: Option<Point<f64>>,
     previous_cubic_control: Option<Point<f64>>,
+}
+
+impl<T: Turtle + std::fmt::Debug> Terrarium<T> {
+    /// Return the currently active composite transform (the result of all
+    /// pushed transforms composed together).  This can be used to seed a
+    /// temporary preprocessing terrarium so that it operates in exactly the
+    /// same coordinate space as the main terrarium at a given point.
+    pub fn current_transform(&self) -> Transform2D<f64> {
+        self.current_transform
+    }
 }
 
 impl<T: Turtle + std::fmt::Debug> Terrarium<T> {
