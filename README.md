@@ -1,160 +1,115 @@
-# svg2gcode
+# Larris
 
-[![Build, test, and publish coverage for svg2gcode](https://github.com/sameer/svg2gcode/actions/workflows/lib.yml/badge.svg)](https://github.com/sameer/svg2gcode/actions/workflows/lib.yml)
+**Larris** (laser + Ferris 🦀) is a desktop GUI for GRBL-based laser engravers.
+It converts SVG and raster images to GCode, previews the toolpath, and streams
+the job directly to the machine over a serial connection — all from one window.
 
-[![Build svg2gcode-cli](https://github.com/sameer/svg2gcode/actions/workflows/cli.yml/badge.svg)](https://github.com/sameer/svg2gcode/actions/workflows/cli.yml)
+Built with Rust, [Relm4](https://relm4.org/) and GTK 4.
 
-[![Build svg2gcode-web](https://github.com/sameer/svg2gcode/actions/workflows/web.yml/badge.svg)](https://github.com/sameer/svg2gcode/actions/workflows/web.yml)
-[![Deploy svg2gcode-web](https://github.com/sameer/svg2gcode/actions/workflows/web-deploy.yml/badge.svg)](https://github.com/sameer/svg2gcode/actions/workflows/web-deploy.yml)
+---
 
-[![codecov](https://codecov.io/gh/sameer/svg2gcode/branch/master/graph/badge.svg)](https://codecov.io/gh/sameer/svg2gcode)
+## Features
 
-Convert vector graphics to g-code for pen plotters, laser engravers, and other CNC machines
+| Tab | What it does |
+|---|---|
+| **Connect** | Scan serial ports, pick baud rate, connect / disconnect, full console with command entry |
+| **Control** | Jog X / Y / Z (0.01 – 100 mm steps), home, feed hold, cycle start, soft reset, status poll, GRBL settings dump |
+| **GCode** | Open SVG or raster image, convert to GCode, manage per-layer settings, preview toolpath, stream to machine, abort, save `.gcode` |
+| **Preview** | Side-by-side SVG source preview and rendered GCode toolpath |
+| **Settings** | Machine dimensions, feedrate, laser power, beam width, begin/end sequences, tolerance, DPI, origin offset |
 
-## Usage
+### Highlights
 
-### Web interface
+- **SVG → GCode** conversion with per-layer feedrate, laser power, pass count and mode (outline / fill / default)
+- **Raster image** engraving via brightness-to-power mapping (with optional invert for anodised aluminium etc.)
+- **Live status bar** — machine state, work position, feed/spindle overrides polled automatically every ~200 ms
+- **Safe serial protocol** — `?` sent as a GRBL real-time byte (no trailing `\n`), jog cancel on 0x85, full ok-gated streaming
+- **Non-blocking UI** — serial I/O runs on a dedicated OS thread; the GTK main loop is never stalled
 
-Check it out at https://sameer.github.io/svg2gcode. Just select an SVG and click generate!
+---
 
-![SVG selected on web interface](https://user-images.githubusercontent.com/11097096/129305765-f78da85d-cf4f-4286-a97c-7124a716b5fa.png)
+## Requirements
 
-### Command line interface (CLI)
+- Rust 1.80+ (edition 2024)
+- GTK 4 development libraries
 
-#### Install
+### Installing GTK 4
+
+**Debian / Ubuntu**
+```sh
+sudo apt install libgtk-4-dev
+```
+
+**Fedora**
+```sh
+sudo dnf install gtk4-devel
+```
+
+**Arch**
+```sh
+sudo pacman -S gtk4
+```
+
+**macOS (Homebrew)**
+```sh
+brew install gtk4
+```
+
+---
+
+## Build & run
 
 ```sh
-cargo install svg2gcode-cli
+git clone https://github.com/sameer/svg2gcode
+cd svg2gcode
+cargo run --release
 ```
 
-#### Usage
-```
-Arguments:
-  [FILE]
-          A file path to an SVG, else reads from stdin
-
-Options:
-      --tolerance <TOLERANCE>
-          Curve interpolation tolerance (mm)
-
-      --feedrate <FEEDRATE>
-          Machine feed rate (mm/min)
-
-      --dpi <DPI>
-          Dots per Inch (DPI) Used for scaling visual units (pixels, points, picas, etc.)
-
-      --on <TOOL_ON_SEQUENCE>
-          G-Code for turning on the tool
-
-      --off <TOOL_OFF_SEQUENCE>
-          G-Code for turning off the tool
-
-      --begin <BEGIN_SEQUENCE>
-          G-Code for initializing the machine at the beginning of the program
-
-      --end <END_SEQUENCE>
-          G-Code for stopping/idling the machine at the end of the program
-
-  -o, --out <OUT>
-          Output file path (overwrites old files), else writes to stdout
-
-      --settings <SETTINGS>
-          Provide settings from a JSON file. Overrides command-line arguments
-
-      --export <EXPORT>
-          Export current settings to a JSON file instead of converting.
-          
-          Use `-` to export to standard out.
-
-      --origin <ORIGIN>
-          Coordinates for the bottom left corner of the machine
-
-      --dimensions <DIMENSIONS>
-          Override the width and height of the SVG (i.e. 210mm,297mm)
-          
-          Useful when the SVG does not specify these (see https://github.com/sameer/svg2gcode/pull/16)
-          
-          Passing "210mm," or ",297mm" calculates the missing dimension to conform to the viewBox aspect ratio.
-
-      --circular-interpolation <CIRCULAR_INTERPOLATION>
-          Whether to use circular arcs when generating g-code
-          
-          Please check if your machine supports G2/G3 commands before enabling this.
-          
-          [possible values: true, false]
-
-      --line-numbers <LINE_NUMBERS>
-          Include line numbers at the beginning of each line
-          
-          Useful for debugging/streaming g-code
-          
-          [possible values: true, false]
-
-      --checksums <CHECKSUMS>
-          Include checksums at the end of each line
-          
-          Useful for streaming g-code
-          
-          [possible values: true, false]
-
-      --newline-before-comment <NEWLINE_BEFORE_COMMENT>
-          Add a newline character before each comment
-          
-          Workaround for parsers that don't accept comments on the same line
-          
-          [possible values: true, false]
-
-  -h, --help
-          Print help (see a summary with '-h')
-
-  -V, --version
-          Print version
-```
-
-#### Example
+Or install to `~/.cargo/bin`:
 
 ```sh
-svg2gcode-cli examples/Vanderbilt_Commodores_logo.svg --off 'M4' --on 'M5' -o out.gcode
+cargo install --path .
+larris
 ```
 
+---
 
-To convert curves to G02/G03 Gcode commands, use flag `--circular-interpolation true`.
+## Workflow
 
-![Vanderbilt Commodores Logo](examples/Vanderbilt_Commodores_logo.svg)
+1. **Connect tab** — select your port (e.g. `/dev/ttyUSB0`), choose 115200 baud, click **Connect**.
+2. **GCode tab** — click **Open** to load an `.svg`, `.png`, or `.jpg` file.
+3. Adjust per-layer settings if needed, then click **Convert**.
+4. Click **Preview** to inspect the rendered toolpath.
+5. Back on GCode — click **Frame** to dry-run the bounding box, then **Send** to stream the job.
+6. Monitor progress in the console on the Connect tab; click **Abort** at any time.
 
-#### Output, rendered at [https://ncviewer.com](https://ncviewer.com)
+---
 
-```sh
-cat out.gcode
-```
+## Settings reference
 
-![Vanderbilt Commodores Logo Gcode](examples/Vanderbilt_Commodores_logo_gcode.png)
+| Field | Default | Description |
+|---|---|---|
+| Begin sequence | `G90 G21 M4` | GCode emitted before the job starts |
+| End sequence | `M5 M2` | GCode emitted after the job ends |
+| Max X / Y (mm) | 150 / 150 | Machine travel limits (used for preview scaling) |
+| Max speed (mm/min) | 10 000 | Upper bound for feedrate |
+| Max laser power (S) | 1 000 | S-word ceiling (GRBL `$30`) |
+| Beam width (mm) | 0.1 | Hatch line spacing for fill layers |
+| Feedrate (mm/min) | 3 000 | Default laser-on feedrate |
+| Tolerance (mm) | 0.1 | Bézier linearisation tolerance |
+| DPI | 96 | Pixel/point/pica scaling for SVGs without explicit units |
+| Laser power (S) | 1 000 | S value written into the begin sequence |
+| Origin X / Y (mm) | 0 / 0 | Workpiece offset applied to all coordinates |
 
-### Library
+---
 
-The core functionality of this tool is available as the [svg2gcode crate](https://crates.io/crates/svg2gcode).
+## Jog step sizes
 
-## Blog Posts
+Use the **+** / **−** buttons on the Control tab to cycle through:
+`0.01 mm` → `0.1 mm` → `1 mm` → `10 mm` → `100 mm`
 
-These go into greater detail on the tool's origins, implementation details, and planned features.
+---
 
-- https://purisa.me/blog/pen-plotter/
-- https://purisa.me/blog/svg2gcode-progress/
+## License
 
-## FAQ / Interesting details
-
-- Use a 3D printer for plotting: (thanks [@jeevank](https://github.com/jeevank) for sharing this) https://medium.com/@urish/how-to-turn-your-3d-printer-into-a-plotter-in-one-hour-d6fe14559f1a
-
-- Convert a PDF to GCode: follow [this guide using Inkscape to convert a PDF to an SVG](https://en.wikipedia.org/wiki/Wikipedia:Graphics_Lab/Resources/PDF_conversion_to_SVG#Conversion_with_Inkscape), then use it with svg2gcode
-
-- Are shapes, fill patterns supported? No, but you can convert them to paths in Inkscape with `Object to Path`. See [#15](https://github.com/sameer/svg2gcode/issues/15) for more discussion.
-- Are stroke patterns supported? No, but you can convert them into paths in Inkscape with `Stroke to Path`.
-
-## Reference Documents
-
-- [W3 SVG2 Specification](https://www.w3.org/TR/SVG/Overview.html)
-- [CSS absolute lengths](https://www.w3.org/TR/css-values/#absolute-lengths)
-- [CSS font-relative lengths](https://www.w3.org/TR/css-values/#font-relative-lengths)
-- [CSS compatible units](https://www.w3.org/TR/css-values/#compat)
-- [RepRap G-code](https://reprap.org/wiki/G-code)
-- [G-Code and M-Code Reference List for Milling](https://www.cnccookbook.com/g-code-m-code-reference-list-cnc-mills/)
+MIT — see [LICENSE](LICENSE).
