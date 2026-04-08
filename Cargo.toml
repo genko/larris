@@ -1,17 +1,58 @@
-[workspace]
-members = ["lib", "cli", "web", "tui"]
-default-members = ["cli"]
-resolver = "2"
-
-[workspace.package]
-authors = ["Sameer Puri <crates@purisa.me>"]
+[package]
+name = "larris"
+version = "0.1.0"
 edition = "2024"
+authors = ["Sameer Puri <crates@purisa.me>"]
 repository = "https://github.com/sameer/svg2gcode"
 license = "MIT"
+description = "Larris – laser + Ferris – a GRBL laser terminal TUI built with Rust"
 
-[workspace.dependencies]
-g-code = "0.6.0"
-log = "0"
-roxmltree = "0.21"
-serde_json = "1"
+[[bin]]
+name = "larris"
+path = "src/main.rs"
+
+[dependencies]
+# g-code emit/parse (used directly for format_gcode_fmt and snippet_parser)
+g-code = "0.6"
+
+# svg2gcode lib deps (inlined as crate::svg2gcode module)
+lyon_geom = "=1.0.6"
+euclid = "0.22"
+uom = "0.38"
+paste = "1"
+serde = { version = "1", features = ["derive", "std"] }
+serde_repr = "0.1"
 svgtypes = "0.16"
+
+# TUI
+ratatui = "0.30"
+ratatui-image = { version = "10", default-features = false, features = ["image-defaults", "crossterm"] }
+crossterm = "0.29"
+
+# Serial port
+serialport = "4"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# GCode parsing (gcode → SVG preview path reconstruction)
+gcode-nom = "0.6"
+
+# Image handling for the SVG preview rendered into ratatui-image
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+# SVG rendering to a pixel buffer (used for the preview panel)
+resvg = "0.44"
+tiny-skia = "0.11"
+usvg = "0.44"
+
+# XML / SVG document parsing (shared with svg2gcode lib)
+roxmltree = "0.21"
+
+# Native file picker dialog (SVG open / GCode save)
+rfd = "0.15"
+
+# Utilities
+anyhow = "1"
+log = "0"
+env_logger = "0.11"
